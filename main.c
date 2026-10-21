@@ -1,7 +1,11 @@
 #include <cjson/cJSON.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
+#include <sys/time.h>
+#include <time.h>
 
 /*
 
@@ -28,6 +32,12 @@
 }
 
 */
+
+static int64_t now_ms() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
 
 // Builds a reply body with the fields every reply needs.
 static cJSON *reply_body(long msg_id, const char *type, long in_reply_to) {
@@ -62,6 +72,15 @@ static void send_error(const char *src, const char *dest, long msg_id, long in_r
 }
 
 int main() {
+  uint32_t NODE_ID;
+  if (getrandom(&NODE_ID, sizeof NODE_ID, 0) != sizeof NODE_ID) {
+    perror("getrandom");
+    return 1;
+  }
+
+  int64_t PREV_GENERATE_TIME_MS = now_ms();
+  int GENERATE_MS_COUNTER = 0;
+
   const size_t JSON_PARSE_BUF_LEN = 4096;
 
   char msg[JSON_PARSE_BUF_LEN];
@@ -123,6 +142,28 @@ int main() {
         cJSON_AddStringToObject(res_body, "echo", echo->valuestring);
         send_reply(dest->valuestring, src->valuestring, res_body);
       }
+
+    } else if (!strcmp(type->valuestring, "generate")) {
+      int64_t now = now_ms();
+      if (now == PREV_GENERATE_TIME_MS) {
+        if ((GENERATE_MS_COUNTER + 1) >= (1 << 12)) {
+          do {
+            now = now_ms();
+          } while (PREV_GENERATE_TIME_MS == now);
+          PREV_GENERATE_TIME_MS = now;
+          GENERATE_MS_COUNTER = 0;
+        } else {
+          GENERATE_MS_COUNTER++;
+        }
+      } else {
+        PREV_GENERATE_TIME_MS = now;
+        GENERATE_MS_COUNTER = 0;
+      }
+      char id[64];
+      snprintf(id, sizeof id, "%u-%lld-%d", NODE_ID, (long long)now, GENERATE_MS_COUNTER);
+      cJSON *res_body = reply_body(next_msg_id++, "generate_ok", in_reply_to);
+      cJSON_AddStringToObject(res_body, "id", id);
+      send_reply(dest->valuestring, src->valuestring, res_body);
     } else {
       send_error(dest->valuestring, src->valuestring, next_msg_id++, in_reply_to, 10,
                  "not supported");
