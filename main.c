@@ -7,31 +7,11 @@
 #include <sys/time.h>
 #include <time.h>
 
-/*
-
-{
-  "src": "c1",
-  "dest": "n1",
-  "body": {
-    "type": "echo",
-    "msg_id": 1,
-    "echo": "Please echo 35"
-  }
-}
-
-
-{
-  "src": "n1",
-  "dest": "c1",
-  "body": {
-    "type": "echo_ok",
-    "msg_id": 1,
-    "in_reply_to": 1,
-    "echo": "Please echo 35"
-  }
-}
-
-*/
+typedef struct {
+  int32_t msg_vals[4096];
+  size_t size;
+  size_t cap;
+} BroadcastMessages;
 
 static int64_t now_ms() {
   struct timeval tv;
@@ -85,6 +65,8 @@ int main() {
 
   char msg[JSON_PARSE_BUF_LEN];
   long next_msg_id = 1;
+
+  BroadcastMessages bd_msg = {{0}, 0, 4096};
 
   while (fgets(msg, sizeof msg, stdin)) {
     cJSON *msg_json = cJSON_Parse(msg);
@@ -164,6 +146,42 @@ int main() {
       cJSON *res_body = reply_body(next_msg_id++, "generate_ok", in_reply_to);
       cJSON_AddStringToObject(res_body, "id", id);
       send_reply(dest->valuestring, src->valuestring, res_body);
+    } else if (!strcmp(type->valuestring, "broadcast")) {
+      if (bd_msg.size >= bd_msg.cap) {
+        return 1;
+      }
+      if (!cJSON_HasObjectItem(body, "message")) {
+        send_error(dest->valuestring, src->valuestring, next_msg_id++, in_reply_to, 69,
+                   "incorrect broadcast type");
+      } else {
+        const cJSON *msg_val = cJSON_GetObjectItem(body, "message");
+
+        if (!cJSON_IsNumber(msg_val)) {
+          send_error(dest->valuestring, src->valuestring, next_msg_id++, in_reply_to, 69,
+                     "incorrect broadcast type");
+        } else {
+          bd_msg.msg_vals[bd_msg.size++] = msg_val->valueint;
+          cJSON *res_body = reply_body(next_msg_id++, "broadcast_ok", in_reply_to);
+          send_reply(dest->valuestring, src->valuestring, res_body);
+        }
+      }
+    } else if (!strcmp(type->valuestring, "read")) {
+      cJSON *res_body = reply_body(next_msg_id++, "read_ok", in_reply_to);
+      cJSON *msg_arr = cJSON_AddArrayToObject(res_body, "messages");
+      for (size_t i = 0; i < bd_msg.size; ++i) {
+        if (!cJSON_AddItemToArray(msg_arr, cJSON_CreateNumber((double)bd_msg.msg_vals[i]))) {
+          return 1;
+        }
+      }
+      send_reply(dest->valuestring, src->valuestring, res_body);
+    } else if (!strcmp(type->valuestring, "topology")) {
+      if (!cJSON_HasObjectItem(body, "topology")) {
+        send_error(dest->valuestring, src->valuestring, next_msg_id++, in_reply_to, 69,
+                   "incorrect topology type");
+      } else {
+        cJSON *res_body = reply_body(next_msg_id++, "topology_ok", in_reply_to);
+        send_reply(dest->valuestring, src->valuestring, res_body);
+      }
     } else {
       send_error(dest->valuestring, src->valuestring, next_msg_id++, in_reply_to, 10,
                  "not supported");
