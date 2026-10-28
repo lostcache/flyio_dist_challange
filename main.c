@@ -50,7 +50,7 @@ typedef struct {
 
 static PendingKVReadAll pending_kv_read_alls[MAX_PENDING];
 
-PendingKVReadAll *alloc_pending_kv_read_all(void) {
+static PendingKVReadAll *alloc_pending_kv_read_all(void) {
   for (usize i = 0; i < MAX_PENDING; ++i) {
     if (!pending_kv_read_alls[i].used) {
       return &pending_kv_read_alls[i];
@@ -59,7 +59,7 @@ PendingKVReadAll *alloc_pending_kv_read_all(void) {
   return NULL;
 }
 
-PendingKVReadAll *find_pending_kv_read_all(u64 kv_msg_id) {
+static PendingKVReadAll *find_pending_kv_read_all(u64 kv_msg_id) {
   for (usize i = 0; i < MAX_PENDING; ++i) {
     if (!pending_kv_read_alls[i].used)
       continue;
@@ -137,7 +137,7 @@ int main(void) {
 
   i64 counter = 0;
 
-  while (fgets((char *)msg, sizeof msg, stdin)) {
+  while (fgets((char *)msg, (i32)sizeof msg, stdin)) {
     cJSON *msg_json = cJSON_Parse((const char *)msg);
     if (!msg_json) {
       fprintf(stderr, "couldn't parse msg: %s\n", (const char *)msg);
@@ -192,7 +192,7 @@ int main(void) {
       if (!pr)
         continue;
 
-      pr->sum += value;
+      pr->sum += (i64)value;
       if (--pr->remaining == 0) {
         cJSON *res = reply_body(next_msg_id++, (const u8 *)"read_ok", pr->client_msg_id);
         cJSON_AddNumberToObject(res, "value", (double)pr->sum);
@@ -391,19 +391,19 @@ int main(void) {
 
       bool read_send_errored = false;
       for (usize i = 0; i < next_node_idx; ++i) {
-        cJSON *body = cJSON_CreateObject();
+        cJSON *res_body = cJSON_CreateObject();
         u64 kv_id = next_msg_id++;
 
-        if (!cJSON_AddStringToObject(body, "type", "read") ||
-            !cJSON_AddStringToObject(body, "key", (const char *)NODE_IDS[i]) ||
-            !cJSON_AddNumberToObject(body, "msg_id", (double)kv_id)) {
+        if (!cJSON_AddStringToObject(res_body, "type", "read") ||
+            !cJSON_AddStringToObject(res_body, "key", (const char *)NODE_IDS[i]) ||
+            !cJSON_AddNumberToObject(res_body, "msg_id", (double)kv_id)) {
           read_send_errored = true;
-          cJSON_Delete(body);
+          cJSON_Delete(res_body);
           break;
         }
 
         pr->kv_read_msg_ids[pr->kv_count++] = kv_id;
-        send(NODE_ID, (const u8 *)"seq-kv", body);
+        send(NODE_ID, (const u8 *)"seq-kv", res_body);
       }
 
       if (read_send_errored) {
@@ -452,11 +452,11 @@ int main(void) {
       pa->client_msg_id = in_reply_to;
       snprintf((char *)pa->client_src, sizeof pa->client_src, "%s", src->valuestring);
 
-      counter += delta_obj->valuedouble;
+      counter += (i64)delta_obj->valuedouble;
       cJSON *res_body = cJSON_CreateObject();
       cJSON_AddItemToObject(res_body, "type", cJSON_CreateString("write"));
       cJSON_AddItemToObject(res_body, "key", cJSON_CreateString((const char *)NODE_ID));
-      cJSON_AddItemToObject(res_body, "value", cJSON_CreateNumber(counter));
+      cJSON_AddItemToObject(res_body, "value", cJSON_CreateNumber((double)counter));
       cJSON_AddItemToObject(res_body, "msg_id", cJSON_CreateNumber((double)pa->kv_msg_id));
       send(NODE_ID, (const u8 *)"seq-kv", res_body);
     } else {

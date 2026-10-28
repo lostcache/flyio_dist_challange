@@ -1,0 +1,68 @@
+# clangd configuration for this project.
+#
+# This repository has no build system. These flags extend the build command:
+#
+#   clang main.c -lcjson
+#
+# The warning flags are strict. clangd reports every warning as an error.
+
+CompileFlags:
+  # Use clang as the compiler driver for all translation units.
+  Compiler: clang
+
+  Add:
+    # The code uses the default GNU C17 mode of clang.
+    - -std=gnu17
+
+    # Resolve "types.h" from the project root.
+    - -I.
+
+    # Enable the standard warning set.
+    - -Wall
+    - -Wextra
+    - -Wpedantic
+
+    # Enable useful C-specific warnings.
+    - -Wshadow
+    - -Wconversion
+    - -Wstrict-prototypes
+    - -Wmissing-prototypes
+    - -Wundef
+
+    # Treat every warning as an error.
+    - -Werror
+
+Index:
+  # Index the project in the background. This keeps completion and navigation
+  # fast while the code changes.
+  Background: Build
+
+Diagnostics:
+  # Run high-value clang-tidy checks. Do not run style-only checks that would
+  # add noise to this small C project.
+  ClangTidy:
+    Add:
+      - bugprone-*
+      - clang-analyzer-*
+      - performance-*
+      - portability-*
+    Remove:
+      - bugprone-easily-swappable-parameters
+
+  # Report unused includes. Do not require every declaration to have a direct
+  # include. The local headers already provide the needed types.
+  UnusedIncludes: Strict
+  MissingIncludes: None
+
+InlayHints:
+  Enabled: Yes
+  ParameterNames: Yes
+  DeducedTypes: Yes
+  Designators: Yes
+
+Completion:
+  AllScopes: Yes
+  ArgumentLists: FullPlaceholders
+
+Hover:
+  ShowAKA: Yes
