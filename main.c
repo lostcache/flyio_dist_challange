@@ -11,8 +11,13 @@
 #include "types.h"
 
 #define MAX_NODES 128
-#define NODE_NAME_LEN 16
+#define MAX_NODE_NAME_LEN 16
 #define MAX_PENDING 256
+
+#define MAX_LOGS 1024
+#define MAX_LOG_KEY_LEN 16
+#define MAX_LOG_KEY_LEN 16
+#define LOG_RING_BUF_SIZE 128
 
 typedef struct {
   i32 msg_vals[4096];
@@ -24,7 +29,7 @@ typedef struct {
   bool used;
   u64 kv_msg_id;
   u64 client_msg_id;
-  u8 client_src[NODE_NAME_LEN];
+  u8 client_src[MAX_NODE_NAME_LEN];
 } PendingKVAdd;
 
 static PendingKVAdd pending_adds[MAX_PENDING];
@@ -41,7 +46,7 @@ static PendingKVAdd *find_pending_add(u64 kv_msg_id) {
 typedef struct {
   bool used;
   u64 client_msg_id;
-  u8 client_src[NODE_NAME_LEN];
+  u8 client_src[MAX_NODE_NAME_LEN];
   u64 kv_read_msg_ids[MAX_NODES];
   usize kv_count;
   usize remaining;
@@ -61,14 +66,35 @@ static PendingKVReadAll *alloc_pending_kv_read_all(void) {
 
 static PendingKVReadAll *find_pending_kv_read_all(u64 kv_msg_id) {
   for (usize i = 0; i < MAX_PENDING; ++i) {
-    if (!pending_kv_read_alls[i].used)
+    if (!pending_kv_read_alls[i].used) {
       continue;
+    }
     for (usize j = 0; j < pending_kv_read_alls[i].kv_count; ++j)
       if (pending_kv_read_alls[i].kv_read_msg_ids[j] == kv_msg_id) {
         return &pending_kv_read_alls[i];
       }
   }
   return NULL;
+}
+
+typedef struct {
+  u8 keys[MAX_LOGS][MAX_LOG_KEY_LEN];
+  i64 logs[MAX_LOGS][LOG_RING_BUF_SIZE];
+  usize used_start_idx[MAX_LOGS];
+  usize empty_idx[MAX_LOGS];
+  usize log_entries_count[MAX_LOGS];
+  usize next_log_idx;
+  u64 next_log_offsets[MAX_LOGS];
+  u64 uncomitted_offset_start[MAX_LOGS];
+} LogBuffers;
+
+static i64 find_log_idx_by_key(LogBuffers *lb, const u8 *key) {
+  for (usize i = 0; i < lb->next_log_idx; ++i) {
+    if (!strncmp((const char *)key, (const char *)lb->keys[i], MAX_LOG_KEY_LEN)) {
+      return (i64)i;
+    }
+  }
+  return -1;
 }
 
 static i64 now_ms(void) {
@@ -119,16 +145,16 @@ static PendingKVAdd *alloc_pending_read(void) {
 }
 
 int main(void) {
-  u8 NODE_ID[NODE_NAME_LEN];
+  u8 NODE_ID[MAX_NODE_NAME_LEN];
   bool node_id_set = false;
 
-  u8 NODE_IDS[MAX_NODES][NODE_NAME_LEN];
+  u8 NODE_IDS[MAX_NODES][MAX_NODE_NAME_LEN];
   usize next_node_idx = 0;
 
   i64 PREV_GENERATE_TIME_MS = now_ms();
   i32 GENERATE_MS_COUNTER = 0;
 
-  const usize JSON_PARSE_BUF_LEN = 4096;
+  const usize JSON_PARSE_BUF_LEN = 65536;
 
   u8 msg[JSON_PARSE_BUF_LEN];
   u64 next_msg_id = 1;
@@ -137,8 +163,15 @@ int main(void) {
 
   i64 counter = 0;
 
+  LogBuffers *lb = calloc(1, sizeof *lb);
+  if (!lb) {
+    fprintf(stderr, "could not allocate log buffers\n");
+    return 1;
+  }
+
   while (fgets((char *)msg, (i32)sizeof msg, stdin)) {
     cJSON *msg_json = cJSON_Parse((const char *)msg);
+
     if (!msg_json) {
       fprintf(stderr, "couldn't parse msg: %s\n", (const char *)msg);
       continue;
@@ -166,7 +199,7 @@ int main(void) {
     }
 
     if (!cJSON_HasObjectItem(body, "type")) {
-      fprintf(stderr, "field/s type, msg_id not found\n");
+      fprintf(stderr, "field/s type not found\n");
       cJSON_Delete(msg_json);
       continue;
     }
@@ -291,7 +324,7 @@ int main(void) {
         if (next_node_idx >= MAX_NODES) {
           break;
         }
-        snprintf((char *)NODE_IDS[next_node_idx], NODE_NAME_LEN, "%s", it->valuestring);
+        snprintf((char *)NODE_IDS[next_node_idx], MAX_NODE_NAME_LEN, "%s", it->valuestring);
         ++next_node_idx;
       }
 
@@ -364,10 +397,11 @@ int main(void) {
       cJSON *res_body = reply_body(next_msg_id++, (const u8 *)"broadcast_ok", in_reply_to);
       send((const u8 *)dest->valuestring, (const u8 *)src->valuestring, res_body);
     } else if (!strcmp(type->valuestring, "read")) {
-      // cJSON *res_body = reply_body(next_msg_id++, (const u8 *)"read_ok", in_reply_to);
-      // cJSON *msg_arr = cJSON_AddArrayToObject(res_body, "messages");
-      // for (usize i = 0; i < bd_msg.size; ++i) {
-      //   if (!cJSON_AddItemToArray(msg_arr, cJSON_CreateNumber((double)bd_msg.msg_vals[i])))
+      // cJSON *res_body = reply_body(next_msg_id++, (const u8 *)"read_ok",
+      // in_reply_to); cJSON *msg_arr = cJSON_AddArrayToObject(res_body,
+      // "messages"); for (usize i = 0; i < bd_msg.size; ++i) {
+      //   if (!cJSON_AddItemToArray(msg_arr,
+      //   cJSON_CreateNumber((double)bd_msg.msg_vals[i])))
       //   {
       //     return 1;
       //   }
@@ -409,7 +443,8 @@ int main(void) {
       if (read_send_errored) {
         send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
                    in_reply_to, 69,
-                   (const u8 *)"something went wrong while sending read request to kv-seq node");
+                   (const u8 *)"something went wrong while sending read "
+                               "request to kv-seq node");
         cJSON_Delete(msg_json);
         continue;
       }
@@ -459,6 +494,271 @@ int main(void) {
       cJSON_AddItemToObject(res_body, "value", cJSON_CreateNumber((double)counter));
       cJSON_AddItemToObject(res_body, "msg_id", cJSON_CreateNumber((double)pa->kv_msg_id));
       send(NODE_ID, (const u8 *)"seq-kv", res_body);
+    } else if (!strcmp(type->valuestring, "send")) {
+      if (!cJSON_HasObjectItem(body, "key") || !cJSON_HasObjectItem(body, "msg")) {
+        send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                   in_reply_to, 69, (const u8 *)"malformed send message/n");
+        cJSON_Delete(msg_json);
+        continue;
+      }
+
+      cJSON *key_obj = cJSON_GetObjectItem(body, "key"),
+            *msg_obj = cJSON_GetObjectItem(body, "msg");
+
+      if (!cJSON_IsString(key_obj) || !cJSON_IsNumber(msg_obj)) {
+        send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                   in_reply_to, 69, (const u8 *)"malformed send message/n");
+        cJSON_Delete(msg_json);
+        continue;
+      }
+
+      i64 log_idx = find_log_idx_by_key(lb, (const u8 *)key_obj->valuestring);
+
+      if (log_idx == -1) {
+        if (lb->next_log_idx + 1 >= MAX_LOGS) {
+          send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                     in_reply_to, 69, (const u8 *)"can not support more logs/n");
+          cJSON_Delete(msg_json);
+          continue;
+        }
+
+        log_idx = (i64)lb->next_log_idx++;
+        snprintf((char *)lb->keys[log_idx], MAX_LOG_KEY_LEN, "%s", key_obj->valuestring);
+      }
+
+      if (lb->log_entries_count[log_idx] >= LOG_RING_BUF_SIZE) {
+        send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                   in_reply_to, 69, (const u8 *)"ran out of buffer space/n");
+        cJSON_Delete(msg_json);
+        continue;
+      }
+
+      lb->logs[log_idx][lb->empty_idx[log_idx]++] = (i64)msg_obj->valuedouble;
+      ++lb->log_entries_count[log_idx];
+      ++lb->next_log_offsets[log_idx];
+
+      cJSON *res_body = reply_body(next_msg_id++, (const u8 *)"send_ok", in_reply_to);
+      if (!cJSON_AddNumberToObject(res_body, "offset", (double)lb->next_log_offsets[log_idx] - 1)) {
+        send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                   in_reply_to, 69, (const u8 *)"couldn't add to json obj/n");
+        cJSON_Delete(msg_json);
+        cJSON_Delete(res_body);
+        continue;
+      }
+
+      send((const u8 *)dest->valuestring, (const u8 *)src->valuestring, res_body);
+    } else if (!strcmp(type->valuestring, "poll")) {
+      if (!cJSON_HasObjectItem(body, "offsets")) {
+        send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                   in_reply_to, 69, (const u8 *)"malformed poll request/n");
+        cJSON_Delete(msg_json);
+        continue;
+      }
+
+      cJSON *offsets_obj = cJSON_GetObjectItem(body, "offsets");
+      cJSON *offset_items = offsets_obj->child;
+
+      cJSON *poll_res_obj = reply_body(next_msg_id++, (const u8 *)"poll_ok", in_reply_to);
+      if (!poll_res_obj) {
+        send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                   in_reply_to, 69, (const u8 *)"couldn't add to json obj/n");
+        cJSON_Delete(msg_json);
+        continue;
+      }
+
+      cJSON *msgs_obj = cJSON_AddObjectToObject(poll_res_obj, "msgs");
+      if (!msgs_obj) {
+        send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                   in_reply_to, 69, (const u8 *)"couldn't add to json obj/n");
+        cJSON_Delete(poll_res_obj);
+        cJSON_Delete(msg_json);
+        continue;
+      }
+
+      bool error_during_iterarion = false;
+      cJSON *it = offset_items;
+      while (it) {
+        const char *key = it->string;
+        const u64 offset = (u64)it->valuedouble;
+
+        i64 log_idx = find_log_idx_by_key(lb, (const u8 *)key);
+        if (log_idx == -1) {
+          it = it->next;
+          continue;
+        }
+
+        if (lb->next_log_offsets[log_idx] - offset > LOG_RING_BUF_SIZE) {
+          send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                     in_reply_to, 69, (const u8 *)"ran out of buffer space/n");
+          error_during_iterarion = true;
+          break;
+        }
+
+        usize start_idx = offset % LOG_RING_BUF_SIZE,
+              end_idx = lb->next_log_offsets[log_idx] % LOG_RING_BUF_SIZE - 1;
+        if (lb->empty_idx[log_idx] > lb->used_start_idx[log_idx]) {
+          if (start_idx < lb->used_start_idx[log_idx] || end_idx >= lb->empty_idx[log_idx]) {
+            send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                       in_reply_to, 69, (const u8 *)"invalid read/n");
+            error_during_iterarion = true;
+            break;
+          }
+        } else {
+          if ((start_idx < lb->used_start_idx[log_idx] && start_idx >= lb->empty_idx[log_idx]) ||
+              (end_idx < lb->used_start_idx[log_idx] && end_idx >= lb->empty_idx[log_idx])) {
+            send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                       in_reply_to, 69, (const u8 *)"invalid read/n");
+            error_during_iterarion = true;
+            break;
+          }
+        }
+
+        cJSON *log_res_arr = cJSON_AddArrayToObject(msgs_obj, key);
+        if (!log_res_arr) {
+          send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                     in_reply_to, 69, (const u8 *)"could't add to json/n");
+          error_during_iterarion = true;
+          break;
+        }
+
+        bool error_in_for_loop = false;
+        for (u64 i = offset; i < lb->next_log_offsets[log_idx]; ++i) {
+          u64 idx = i % LOG_RING_BUF_SIZE;
+          cJSON *res_offset_obj = cJSON_CreateNumber((double)i);
+          if (!res_offset_obj) {
+            error_in_for_loop = true;
+            break;
+          }
+
+          cJSON *res_val_obj = cJSON_CreateNumber((double)lb->logs[log_idx][idx]);
+          if (!res_val_obj) {
+            cJSON_Delete(res_offset_obj);
+            error_in_for_loop = true;
+          }
+
+          cJSON *arr = cJSON_CreateArray();
+          if (!arr) {
+            cJSON_Delete(res_offset_obj);
+            cJSON_Delete(res_val_obj);
+            error_in_for_loop = true;
+            break;
+          }
+
+          if (!cJSON_AddItemToArray(arr, res_offset_obj) ||
+              !cJSON_AddItemToArray(arr, res_val_obj) || !cJSON_AddItemToArray(log_res_arr, arr)) {
+            cJSON_Delete(res_offset_obj);
+            cJSON_Delete(res_val_obj);
+            cJSON_Delete(arr);
+            error_in_for_loop = true;
+            break;
+          }
+        }
+
+        if (error_in_for_loop) {
+          send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                     in_reply_to, 69, (const u8 *)"could't add to json/n");
+          error_during_iterarion = true;
+          break;
+        }
+
+        it = it->next;
+      }
+
+      if (error_during_iterarion) {
+        cJSON_Delete(poll_res_obj);
+        cJSON_Delete(msg_json);
+        continue;
+      }
+
+      send((const u8 *)dest->valuestring, (const u8 *)src->valuestring, poll_res_obj);
+    } else if (!strcmp(type->valuestring, "commit_offsets")) {
+      cJSON *offsets_obj = cJSON_GetObjectItem(body, "offsets");
+      if (!offsets_obj) {
+        send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                   in_reply_to, 69, (const u8 *)"malformed commit msg/n");
+        cJSON_Delete(msg_json);
+        continue;
+      }
+
+      cJSON *it = offsets_obj->child;
+      while (it) {
+        const u8 *key = (const u8 *)it->string;
+        const u64 offset_val = (u64)it->valuedouble;
+
+        i64 log_idx = find_log_idx_by_key(lb, key);
+        if (log_idx == -1) {
+          it = it->next;
+          continue;
+        }
+
+        u64 next_uncommitted = offset_val + 1;
+        if (next_uncommitted > lb->uncomitted_offset_start[log_idx]) {
+          lb->uncomitted_offset_start[log_idx] = next_uncommitted;
+        }
+
+        it = it->next;
+      }
+
+      cJSON *res_body = reply_body(next_msg_id++, (const u8 *)"commit_offsets_ok", in_reply_to);
+      send((const u8 *)dest->valuestring, (const u8 *)src->valuestring, res_body);
+    } else if (!strcmp(type->valuestring, "list_committed_offsets")) {
+      cJSON *keys_arr_obj = cJSON_GetObjectItem(body, "keys");
+      if (!keys_arr_obj || !cJSON_IsArray(keys_arr_obj)) {
+        send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                   in_reply_to, 69, (const u8 *)"malformed list committed msg/n");
+        cJSON_Delete(msg_json);
+        continue;
+      }
+
+      cJSON *res_body =
+          reply_body(next_msg_id++, (const u8 *)"list_committed_offsets_ok", in_reply_to);
+      if (!res_body) {
+        send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                   in_reply_to, 69, (const u8 *)"couldn't add to json/n");
+        cJSON_Delete(msg_json);
+        continue;
+      }
+
+      cJSON *res_offsets_obj = cJSON_AddObjectToObject(res_body, "offsets");
+      if (!res_offsets_obj) {
+        send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                   in_reply_to, 69, (const u8 *)"couldn't add to json/n");
+        cJSON_Delete(msg_json);
+        cJSON_Delete(res_body);
+        continue;
+      }
+
+      cJSON *it;
+      bool error_in_for_loop = false;
+      cJSON_ArrayForEach(it, keys_arr_obj) {
+        if (!cJSON_IsString(it)) {
+          error_in_for_loop = true;
+          break;
+        }
+
+        const u8 *key_str = (const u8 *)it->valuestring;
+
+        i64 log_idx = find_log_idx_by_key(lb, key_str);
+        if (log_idx == -1) {
+          continue;
+        }
+
+        if (!cJSON_AddNumberToObject(res_offsets_obj, (const char *)key_str,
+                                     (double)lb->uncomitted_offset_start[log_idx] - 1)) {
+          error_in_for_loop = true;
+          break;
+        }
+      }
+
+      if (error_in_for_loop) {
+        send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
+                   in_reply_to, 69, (const u8 *)"malformed list committed msg/n");
+        cJSON_Delete(msg_json);
+        cJSON_Delete(res_body);
+        continue;
+      }
+
+      send((const u8 *)dest->valuestring, (const u8 *)src->valuestring, res_body);
     } else {
       send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
                  in_reply_to, 10, (const u8 *)"not supported");
@@ -469,5 +769,6 @@ int main(void) {
     cJSON_Delete(msg_json);
   }
 
+  free(lb);
   return 0;
 }
