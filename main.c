@@ -122,25 +122,52 @@ static i64 now_ms(void) {
     return (i64)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
+// Prints a message and stops the program. Use only when a reply cannot be built.
+static _Noreturn void fatal(const char *message) {
+    fprintf(stderr, "fatal: %s\n", message);
+    exit(EXIT_FAILURE);
+}
+
 // Builds a reply body with the fields every reply needs.
 static cJSON *reply_body(u64 msg_id, const u8 *type, u64 in_reply_to) {
     cJSON *body = cJSON_CreateObject();
-    cJSON_AddStringToObject(body, "type", (const char *)type);
-    cJSON_AddNumberToObject(body, "msg_id", (double)msg_id);
-    cJSON_AddNumberToObject(body, "in_reply_to", (double)in_reply_to);
+    if (!body) {
+        fatal("could not create reply body");
+    }
+    if (!cJSON_AddStringToObject(body, "type", (const char *)type) ||
+        !cJSON_AddNumberToObject(body, "msg_id", (double)msg_id) ||
+        !cJSON_AddNumberToObject(body, "in_reply_to", (double)in_reply_to)) {
+        cJSON_Delete(body);
+        fatal("could not build reply body");
+    }
     return body;
 }
 
 // Wraps a body into an envelope and writes it to stdout.
 static void send(const u8 *src, const u8 *dest, cJSON *body) {
     cJSON *res = cJSON_CreateObject();
-    cJSON_AddStringToObject(res, "src", (const char *)src);
-    cJSON_AddStringToObject(res, "dest", (const char *)dest);
-    cJSON_AddItemToObject(res, "body", body);
+    if (!res) {
+        cJSON_Delete(body);
+        fatal("could not create reply envelope");
+    }
+    if (!cJSON_AddStringToObject(res, "src", (const char *)src) ||
+        !cJSON_AddStringToObject(res, "dest", (const char *)dest) ||
+        !cJSON_AddItemToObject(res, "body", body)) {
+        cJSON_Delete(res);
+        cJSON_Delete(body);
+        fatal("could not build reply envelope");
+    }
 
-    u8 *out = (u8 *)cJSON_PrintUnformatted(res);
-    printf("%s\n", (const char *)out);
-    fflush(stdout);
+    char *out = cJSON_PrintUnformatted(res);
+    if (!out) {
+        cJSON_Delete(res);
+        fatal("could not serialize reply");
+    }
+    if (printf("%s\n", out) < 0 || fflush(stdout) != 0) {
+        free(out);
+        cJSON_Delete(res);
+        fatal("could not write reply");
+    }
 
     free(out);
     cJSON_Delete(res);
@@ -149,8 +176,11 @@ static void send(const u8 *src, const u8 *dest, cJSON *body) {
 static void send_error(const u8 *src, const u8 *dest, u64 msg_id, u64 in_reply_to, i32 code,
                        const u8 *text) {
     cJSON *body = reply_body(msg_id, (const u8 *)"error", in_reply_to);
-    cJSON_AddNumberToObject(body, "code", code);
-    cJSON_AddStringToObject(body, "text", (const char *)text);
+    if (!cJSON_AddNumberToObject(body, "code", code) ||
+        !cJSON_AddStringToObject(body, "text", (const char *)text)) {
+        cJSON_Delete(body);
+        fatal("could not build error reply");
+    }
     send(src, dest, body);
 }
 
@@ -184,14 +214,12 @@ int main(void) {
 
     LogBuffers *lb = calloc(1, sizeof *lb);
     if (!lb) {
-        fprintf(stderr, "could not allocate log buffers\n");
-        return 1;
+        fatal("could not allocate log buffers");
     }
 
     KVStore *kvs = calloc(1, sizeof *kvs);
     if (!kvs) {
-        fprintf(stderr, "could not allocate kv buffer\n");
-        return 1;
+        fatal("could not allocate kv buffer");
     }
 
     while (fgets((char *)msg, (i32)sizeof msg, stdin)) {
@@ -270,7 +298,10 @@ int main(void) {
             pr->sum += (i64)value;
             if (--pr->remaining == 0) {
                 cJSON *res = reply_body(next_msg_id++, (const u8 *)"read_ok", pr->client_msg_id);
-                cJSON_AddNumberToObject(res, "value", (double)pr->sum);
+                if (!cJSON_AddNumberToObject(res, "value", (double)pr->sum)) {
+                    cJSON_Delete(res);
+                    fatal("could not build read reply");
+                }
                 send(NODE_ID, pr->client_src, res);
                 pr->used = 0;
             }
@@ -314,7 +345,10 @@ int main(void) {
                 if (pr && --pr->remaining == 0) {
                     cJSON *res =
                         reply_body(next_msg_id++, (const u8 *)"read_ok", pr->client_msg_id);
-                    cJSON_AddNumberToObject(res, "value", (double)pr->sum);
+                    if (!cJSON_AddNumberToObject(res, "value", (double)pr->sum)) {
+                        cJSON_Delete(res);
+                        fatal("could not build read reply");
+                    }
                     send(NODE_ID, pr->client_src, res);
                     pr->used = 0;
                 }
@@ -404,7 +438,10 @@ int main(void) {
             }
 
             cJSON *res_body = reply_body(next_msg_id++, (const u8 *)"echo_ok", in_reply_to);
-            cJSON_AddStringToObject(res_body, "echo", echo->valuestring);
+            if (!cJSON_AddStringToObject(res_body, "echo", echo->valuestring)) {
+                cJSON_Delete(res_body);
+                fatal("could not build echo reply");
+            }
             send((const u8 *)dest->valuestring, (const u8 *)src->valuestring, res_body);
 
         } else if (!strcmp(type->valuestring, "generate")) {
@@ -442,12 +479,17 @@ int main(void) {
                 continue;
             }
             cJSON *res_body = reply_body(next_msg_id++, (const u8 *)"generate_ok", in_reply_to);
-            cJSON_AddStringToObject(res_body, "id", (const char *)id);
+            if (!cJSON_AddStringToObject(res_body, "id", (const char *)id)) {
+                cJSON_Delete(res_body);
+                fatal("could not build generate reply");
+            }
             send((const u8 *)dest->valuestring, (const u8 *)src->valuestring, res_body);
         } else if (!strcmp(type->valuestring, "broadcast")) {
             if (bd_msg.size >= bd_msg.cap) {
+                send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
+                           next_msg_id++, in_reply_to, 69, (const u8 *)"broadcast buffer full");
                 cJSON_Delete(msg_json);
-                return 1;
+                continue;
             }
 
             if (!cJSON_HasObjectItem(body, "message")) {
@@ -496,30 +538,22 @@ int main(void) {
             pr->remaining = next_node_idx;
             pr->kv_count = 0;
 
-            bool read_send_errored = false;
             for (usize i = 0; i < next_node_idx; ++i) {
                 cJSON *res_body = cJSON_CreateObject();
+                if (!res_body) {
+                    fatal("could not create read request");
+                }
                 u64 kv_id = next_msg_id++;
 
                 if (!cJSON_AddStringToObject(res_body, "type", "read") ||
                     !cJSON_AddStringToObject(res_body, "key", (const char *)NODE_IDS[i]) ||
                     !cJSON_AddNumberToObject(res_body, "msg_id", (double)kv_id)) {
-                    read_send_errored = true;
                     cJSON_Delete(res_body);
-                    break;
+                    fatal("could not build read request");
                 }
 
                 pr->kv_read_msg_ids[pr->kv_count++] = kv_id;
                 send(NODE_ID, (const u8 *)"seq-kv", res_body);
-            }
-
-            if (read_send_errored) {
-                send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69,
-                           (const u8 *)"something went wrong while sending read "
-                                       "request to kv-seq node");
-                cJSON_Delete(msg_json);
-                continue;
             }
         } else if (!strcmp(type->valuestring, "topology")) {
             if (!cJSON_HasObjectItem(body, "topology")) {
@@ -563,10 +597,16 @@ int main(void) {
 
             counter += (i64)delta_obj->valuedouble;
             cJSON *res_body = cJSON_CreateObject();
-            cJSON_AddItemToObject(res_body, "type", cJSON_CreateString("write"));
-            cJSON_AddItemToObject(res_body, "key", cJSON_CreateString((const char *)NODE_ID));
-            cJSON_AddItemToObject(res_body, "value", cJSON_CreateNumber((double)counter));
-            cJSON_AddItemToObject(res_body, "msg_id", cJSON_CreateNumber((double)pa->kv_msg_id));
+            if (!res_body) {
+                fatal("could not create write request");
+            }
+            if (!cJSON_AddStringToObject(res_body, "type", "write") ||
+                !cJSON_AddStringToObject(res_body, "key", (const char *)NODE_ID) ||
+                !cJSON_AddNumberToObject(res_body, "value", (double)counter) ||
+                !cJSON_AddNumberToObject(res_body, "msg_id", (double)pa->kv_msg_id)) {
+                cJSON_Delete(res_body);
+                fatal("could not build write request");
+            }
             send(NODE_ID, (const u8 *)"seq-kv", res_body);
         } else if (!strcmp(type->valuestring, "send")) {
             if (!cJSON_HasObjectItem(body, "key") || !cJSON_HasObjectItem(body, "msg")) {
@@ -624,12 +664,8 @@ int main(void) {
             cJSON *res_body = reply_body(next_msg_id++, (const u8 *)"send_ok", in_reply_to);
             if (!cJSON_AddNumberToObject(res_body, "offset",
                                          (double)lb->next_log_offsets[log_idx] - 1)) {
-                send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69,
-                           (const u8 *)"couldn't add to json obj/n");
-                cJSON_Delete(msg_json);
                 cJSON_Delete(res_body);
-                continue;
+                fatal("could not build send reply");
             }
 
             send((const u8 *)dest->valuestring, (const u8 *)src->valuestring, res_body);
@@ -645,22 +681,11 @@ int main(void) {
             cJSON *offset_items = offsets_obj->child;
 
             cJSON *poll_res_obj = reply_body(next_msg_id++, (const u8 *)"poll_ok", in_reply_to);
-            if (!poll_res_obj) {
-                send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69,
-                           (const u8 *)"couldn't add to json obj/n");
-                cJSON_Delete(msg_json);
-                continue;
-            }
 
             cJSON *msgs_obj = cJSON_AddObjectToObject(poll_res_obj, "msgs");
             if (!msgs_obj) {
-                send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69,
-                           (const u8 *)"couldn't add to json obj/n");
                 cJSON_Delete(poll_res_obj);
-                cJSON_Delete(msg_json);
-                continue;
+                fatal("could not build poll reply");
             }
 
             bool error_during_iterarion = false;
@@ -691,51 +716,51 @@ int main(void) {
 
                 cJSON *log_res_arr = cJSON_AddArrayToObject(msgs_obj, key);
                 if (!log_res_arr) {
-                    send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                               next_msg_id++, in_reply_to, 69, (const u8 *)"could't add to json/n");
-                    error_during_iterarion = true;
-                    break;
+                    cJSON_Delete(poll_res_obj);
+                    fatal("could not build poll reply");
                 }
 
-                bool error_in_for_loop = false;
                 for (u64 i = offset; i < lb->next_log_offsets[log_idx]; ++i) {
                     u64 idx = i & (LOG_RING_BUF_SIZE - 1);
                     cJSON *res_offset_obj = cJSON_CreateNumber((double)i);
                     if (!res_offset_obj) {
-                        error_in_for_loop = true;
-                        break;
+                        cJSON_Delete(poll_res_obj);
+                        fatal("could not build poll reply");
                     }
 
                     cJSON *res_val_obj = cJSON_CreateNumber((double)lb->logs[log_idx][idx]);
                     if (!res_val_obj) {
                         cJSON_Delete(res_offset_obj);
-                        error_in_for_loop = true;
+                        cJSON_Delete(poll_res_obj);
+                        fatal("could not build poll reply");
                     }
 
                     cJSON *arr = cJSON_CreateArray();
                     if (!arr) {
                         cJSON_Delete(res_offset_obj);
                         cJSON_Delete(res_val_obj);
-                        error_in_for_loop = true;
-                        break;
+                        cJSON_Delete(poll_res_obj);
+                        fatal("could not build poll reply");
                     }
 
-                    if (!cJSON_AddItemToArray(arr, res_offset_obj) ||
-                        !cJSON_AddItemToArray(arr, res_val_obj) ||
-                        !cJSON_AddItemToArray(log_res_arr, arr)) {
+                    if (!cJSON_AddItemToArray(arr, res_offset_obj)) {
                         cJSON_Delete(res_offset_obj);
                         cJSON_Delete(res_val_obj);
                         cJSON_Delete(arr);
-                        error_in_for_loop = true;
-                        break;
+                        cJSON_Delete(poll_res_obj);
+                        fatal("could not build poll reply");
                     }
-                }
-
-                if (error_in_for_loop) {
-                    send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                               next_msg_id++, in_reply_to, 69, (const u8 *)"could't add to json/n");
-                    error_during_iterarion = true;
-                    break;
+                    if (!cJSON_AddItemToArray(arr, res_val_obj)) {
+                        cJSON_Delete(res_val_obj);
+                        cJSON_Delete(arr);
+                        cJSON_Delete(poll_res_obj);
+                        fatal("could not build poll reply");
+                    }
+                    if (!cJSON_AddItemToArray(log_res_arr, arr)) {
+                        cJSON_Delete(arr);
+                        cJSON_Delete(poll_res_obj);
+                        fatal("could not build poll reply");
+                    }
                 }
 
                 it = it->next;
@@ -804,20 +829,11 @@ int main(void) {
 
             cJSON *res_body =
                 reply_body(next_msg_id++, (const u8 *)"list_committed_offsets_ok", in_reply_to);
-            if (!res_body) {
-                send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"couldn't add to json/n");
-                cJSON_Delete(msg_json);
-                continue;
-            }
 
             cJSON *res_offsets_obj = cJSON_AddObjectToObject(res_body, "offsets");
             if (!res_offsets_obj) {
-                send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"couldn't add to json/n");
-                cJSON_Delete(msg_json);
                 cJSON_Delete(res_body);
-                continue;
+                fatal("could not build offsets reply");
             }
 
             cJSON *it;
@@ -837,8 +853,8 @@ int main(void) {
 
                 if (!cJSON_AddNumberToObject(res_offsets_obj, (const char *)key_str,
                                              (double)lb->uncomitted_offset_start[log_idx] - 1)) {
-                    error_in_for_loop = true;
-                    break;
+                    cJSON_Delete(res_body);
+                    fatal("could not build offsets reply");
                 }
             }
 
@@ -864,13 +880,12 @@ int main(void) {
             cJSON *res_body = reply_body(next_msg_id++, (const u8 *)"txn_ok", in_reply_to);
             cJSON *res_txn_arr = cJSON_AddArrayToObject(res_body, "txn");
             if (!res_txn_arr) {
-                send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"couldn't add to json\n");
-                cJSON_Delete(msg_json);
-                continue;
+                cJSON_Delete(res_body);
+                fatal("could not build txn reply");
             }
 
             bool error_in_foreach = false;
+            bool kv_full = false;
             cJSON *it;
             cJSON_ArrayForEach(it, txn_arr_obj) {
                 if (!cJSON_IsArray(it)) {
@@ -896,38 +911,38 @@ int main(void) {
 
                 cJSON *op_res_arr = cJSON_CreateArray();
                 if (!op_res_arr) {
-                    error_in_foreach = true;
-                    break;
+                    cJSON_Delete(res_body);
+                    fatal("could not build txn reply");
                 }
 
                 if (!cJSON_AddItemToArray(res_txn_arr, op_res_arr)) {
                     cJSON_Delete(op_res_arr);
-                    error_in_foreach = true;
-                    break;
+                    cJSON_Delete(res_body);
+                    fatal("could not build txn reply");
                 }
 
                 cJSON *op_str_obj = cJSON_CreateString(op->valuestring);
                 if (!op_str_obj) {
-                    error_in_foreach = true;
-                    break;
+                    cJSON_Delete(res_body);
+                    fatal("could not build txn reply");
                 }
 
                 if (!cJSON_AddItemToArray(op_res_arr, op_str_obj)) {
                     cJSON_Delete(op_str_obj);
-                    error_in_foreach = true;
-                    break;
+                    cJSON_Delete(res_body);
+                    fatal("could not build txn reply");
                 }
 
                 cJSON *key_res_obj = cJSON_CreateNumber((double)key->valuedouble);
                 if (!key_res_obj) {
-                    error_in_foreach = true;
-                    break;
+                    cJSON_Delete(res_body);
+                    fatal("could not build txn reply");
                 }
 
                 if (!cJSON_AddItemToArray(op_res_arr, key_res_obj)) {
                     cJSON_Delete(key_res_obj);
-                    error_in_foreach = true;
-                    break;
+                    cJSON_Delete(res_body);
+                    fatal("could not build txn reply");
                 }
 
                 if (!strcmp(op->valuestring, "r")) {
@@ -940,19 +955,20 @@ int main(void) {
                     }
 
                     if (!val_res_obj) {
-                        error_in_foreach = true;
-                        break;
+                        cJSON_Delete(res_body);
+                        fatal("could not build txn reply");
                     }
 
                     if (!cJSON_AddItemToArray(op_res_arr, val_res_obj)) {
                         cJSON_Delete(val_res_obj);
-                        error_in_foreach = true;
-                        break;
+                        cJSON_Delete(res_body);
+                        fatal("could not build txn reply");
                     }
                 } else if (!strcmp(op->valuestring, "w")) {
                     if (idx == -1) {
                         if (kvs->empty_idx >= MAX_KV_ENTRIES) {
-                            return -1;
+                            kv_full = true;
+                            break;
                         }
                         idx = (i64)kvs->empty_idx++;
                         kvs->keys[idx] = (i64)key->valuedouble;
@@ -961,14 +977,14 @@ int main(void) {
 
                     cJSON *val_write_obj = cJSON_CreateNumber((double)val->valuedouble);
                     if (!val_write_obj) {
-                        error_in_foreach = true;
-                        break;
+                        cJSON_Delete(res_body);
+                        fatal("could not build txn reply");
                     }
 
                     if (!cJSON_AddItemToArray(op_res_arr, val_write_obj)) {
                         cJSON_Delete(val_write_obj);
-                        error_in_foreach = true;
-                        break;
+                        cJSON_Delete(res_body);
+                        fatal("could not build txn reply");
                     }
                 } else {
                     error_in_foreach = true;
@@ -976,10 +992,19 @@ int main(void) {
                 }
             }
 
+            if (kv_full) {
+                send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
+                           next_msg_id++, in_reply_to, 13, (const u8 *)"kv table full");
+                cJSON_Delete(msg_json);
+                cJSON_Delete(res_body);
+                continue;
+            }
+
             if (error_in_foreach) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
                            next_msg_id++, in_reply_to, 69, (const u8 *)"malformed txn msg/n");
                 cJSON_Delete(msg_json);
+                cJSON_Delete(res_body);
                 continue;
             }
 
