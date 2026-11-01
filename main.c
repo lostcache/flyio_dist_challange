@@ -19,6 +19,10 @@
 #define MAX_LOG_KEY_LEN 16
 #define LOG_RING_BUF_SIZE 128
 
+#define MAX_KV_ENTRIES 4096
+#define MAX_KV_KEY_LEN 16
+#define KV_BUF_SIZE 1024
+
 typedef struct {
     i32 msg_vals[4096];
     usize size;
@@ -97,6 +101,21 @@ static i64 find_log_idx_by_key(LogBuffers *lb, const u8 *key) {
     return -1;
 }
 
+typedef struct {
+    i64 keys[MAX_KV_ENTRIES];
+    i64 vals[MAX_KV_ENTRIES];
+    usize empty_idx;
+} KVStore;
+
+static i64 find_kv_entry_idx_by_key(KVStore *kvs, i64 key) {
+    for (usize i = 0; i < kvs->empty_idx; ++i) {
+        if (kvs->keys[i] == key) {
+            return (i64)i;
+        }
+    }
+    return -1;
+}
+
 static i64 now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -166,6 +185,12 @@ int main(void) {
     LogBuffers *lb = calloc(1, sizeof *lb);
     if (!lb) {
         fprintf(stderr, "could not allocate log buffers\n");
+        return 1;
+    }
+
+    KVStore *kvs = calloc(1, sizeof *kvs);
+    if (!kvs) {
+        fprintf(stderr, "could not allocate kv buffer\n");
         return 1;
     }
 
@@ -770,6 +795,137 @@ int main(void) {
                            (const u8 *)"malformed list committed msg/n");
                 cJSON_Delete(msg_json);
                 cJSON_Delete(res_body);
+                continue;
+            }
+
+            send((const u8 *)dest->valuestring, (const u8 *)src->valuestring, res_body);
+        } else if (!strcmp(type->valuestring, "txn")) {
+            cJSON *txn_arr_obj = cJSON_GetObjectItem(body, "txn");
+            if (!txn_arr_obj || !cJSON_IsArray(txn_arr_obj)) {
+                send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
+                           next_msg_id++, in_reply_to, 69, (const u8 *)"malformed txn msg/n");
+                cJSON_Delete(msg_json);
+                continue;
+            }
+
+            cJSON *res_body = reply_body(next_msg_id++, (const u8 *)"txn_ok", in_reply_to);
+            cJSON *res_txn_arr = cJSON_AddArrayToObject(res_body, "txn");
+            if (!res_txn_arr) {
+                send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
+                           next_msg_id++, in_reply_to, 69, (const u8 *)"couldn't add to json\n");
+                cJSON_Delete(msg_json);
+                continue;
+            }
+
+            bool error_in_foreach = false;
+            cJSON *it;
+            cJSON_ArrayForEach(it, txn_arr_obj) {
+                if (!cJSON_IsArray(it)) {
+                    error_in_foreach = true;
+                    break;
+                }
+
+                cJSON *op = cJSON_GetArrayItem(it, 0), *key = cJSON_GetArrayItem(it, 1),
+                      *val = cJSON_GetArrayItem(it, 2);
+
+                if (!op || !cJSON_IsString(op) || !key || !cJSON_IsNumber(key)) {
+                    error_in_foreach = true;
+                    break;
+                }
+
+                if (!strcmp(op->valuestring, "w") && (!val || !cJSON_IsNumber(val))) {
+                    error_in_foreach = true;
+                    break;
+                }
+
+                i64 idx = find_kv_entry_idx_by_key(kvs, (i64)key->valuedouble);
+
+                cJSON *op_res_arr = cJSON_CreateArray();
+                if (!op_res_arr) {
+                    error_in_foreach = true;
+                    break;
+                }
+
+                if (!cJSON_AddItemToArray(res_txn_arr, op_res_arr)) {
+                    cJSON_Delete(op_res_arr);
+                    error_in_foreach = true;
+                    break;
+                }
+
+                cJSON *op_str_obj = cJSON_CreateString(op->valuestring);
+                if (!op_str_obj) {
+                    error_in_foreach = true;
+                    break;
+                }
+
+                if (!cJSON_AddItemToArray(op_res_arr, op_str_obj)) {
+                    cJSON_Delete(op_str_obj);
+                    error_in_foreach = true;
+                    break;
+                }
+
+                cJSON *key_res_obj = cJSON_CreateNumber((double)key->valuedouble);
+                if (!key_res_obj) {
+                    error_in_foreach = true;
+                    break;
+                }
+
+                if (!cJSON_AddItemToArray(op_res_arr, key_res_obj)) {
+                    cJSON_Delete(key_res_obj);
+                    error_in_foreach = true;
+                    break;
+                }
+
+                if (!strcmp(op->valuestring, "r")) {
+                    cJSON *val_res_obj;
+                    if (idx == -1) {
+                        val_res_obj = cJSON_CreateNull();
+                    } else {
+                        i64 read_val = kvs->vals[idx];
+                        val_res_obj = cJSON_CreateNumber((double)read_val);
+                    }
+
+                    if (!val_res_obj) {
+                        error_in_foreach = true;
+                        break;
+                    }
+
+                    if (!cJSON_AddItemToArray(op_res_arr, val_res_obj)) {
+                        cJSON_Delete(val_res_obj);
+                        error_in_foreach = true;
+                        break;
+                    }
+                } else if (!strcmp(op->valuestring, "w")) {
+                    if (idx == -1) {
+                        if (kvs->empty_idx >= MAX_KV_ENTRIES) {
+                            return -1;
+                        }
+                        idx = (i64)kvs->empty_idx++;
+                        kvs->keys[idx] = (i64)key->valuedouble;
+                    }
+                    kvs->vals[idx] = (i64)val->valuedouble;
+
+                    cJSON *val_write_obj = cJSON_CreateNumber((double)val->valuedouble);
+                    if (!val_write_obj) {
+                        error_in_foreach = true;
+                        break;
+                    }
+
+                    if (!cJSON_AddItemToArray(op_res_arr, val_write_obj)) {
+                        cJSON_Delete(val_write_obj);
+                        error_in_foreach = true;
+                        break;
+                    }
+                } else {
+                    error_in_foreach = true;
+                    break;
+                }
+            }
+
+            if (error_in_foreach) {
+                send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
+                           next_msg_id++, in_reply_to, 69, (const u8 *)"malformed txn msg/n");
+                cJSON_Delete(msg_json);
                 continue;
             }
 
