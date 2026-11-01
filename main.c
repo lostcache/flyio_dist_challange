@@ -1,4 +1,7 @@
 #include <cjson/cJSON.h>
+#include <errno.h>
+#include <limits.h>
+#include <poll.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -7,12 +10,14 @@
 #include <sys/random.h>
 #include <sys/time.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "types.h"
 
 #define MAX_NODES 128
 #define MAX_NODE_NAME_LEN 16
 #define MAX_PENDING 256
+#define PENDING_READ_TIMEOUT_MS 5000
 
 #define MAX_LOGS 1024
 #define MAX_LOG_KEY_LEN 16
@@ -58,6 +63,7 @@ typedef struct {
     usize kv_count;
     usize remaining;
     i64 sum;
+    i64 deadline_ms;
 } PendingKVReadAll;
 
 static PendingKVReadAll pending_kv_read_alls[MAX_PENDING];
@@ -184,6 +190,46 @@ static void send_error(const u8 *src, const u8 *dest, u64 msg_id, u64 in_reply_t
     send(src, dest, body);
 }
 
+// Answers expired pending reads with a timeout error and releases their slots.
+static void reap_pending_reads(i64 now, const u8 *node_id, u64 *next_msg_id) {
+    for (usize i = 0; i < MAX_PENDING; ++i) {
+        PendingKVReadAll *pr = &pending_kv_read_alls[i];
+        if (!pr->used || now < pr->deadline_ms) {
+            continue;
+        }
+        send_error(node_id, pr->client_src, (*next_msg_id)++, pr->client_msg_id, 0,
+                   (const u8 *)"timeout");
+        pr->used = false;
+    }
+}
+
+// Returns the poll timeout for the earliest pending read, or -1 when none is pending.
+static int pending_read_timeout_ms(i64 now) {
+    bool found = false;
+    i64 earliest = 0;
+    for (usize i = 0; i < MAX_PENDING; ++i) {
+        const PendingKVReadAll *pr = &pending_kv_read_alls[i];
+        if (!pr->used) {
+            continue;
+        }
+        if (!found || pr->deadline_ms < earliest) {
+            earliest = pr->deadline_ms;
+            found = true;
+        }
+    }
+    if (!found) {
+        return -1;
+    }
+    i64 remaining = earliest - now;
+    if (remaining <= 0) {
+        return 0;
+    }
+    if (remaining > INT_MAX) {
+        return INT_MAX;
+    }
+    return (int)remaining;
+}
+
 static PendingKVAdd *alloc_pending_read(void) {
     for (usize i = 0; i < MAX_PENDING; ++i) {
         if (!pending_adds[i].used) {
@@ -222,7 +268,29 @@ int main(void) {
         fatal("could not allocate kv buffer");
     }
 
-    while (fgets((char *)msg, (i32)sizeof msg, stdin)) {
+    if (setvbuf(stdin, NULL, _IONBF, 0) != 0) {
+        fatal("could not disable stdin buffering");
+    }
+
+    for (;;) {
+        i64 loop_now = now_ms();
+        reap_pending_reads(loop_now, NODE_ID, &next_msg_id);
+
+        struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
+        int ready = poll(&pfd, 1, pending_read_timeout_ms(loop_now));
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            fatal("could not poll stdin");
+        }
+        if (ready == 0) {
+            continue;
+        }
+
+        if (!fgets((char *)msg, (i32)sizeof msg, stdin)) {
+            break;
+        }
         cJSON *msg_json = cJSON_Parse((const char *)msg);
 
         if (!msg_json) {
@@ -537,6 +605,7 @@ int main(void) {
             pr->sum = 0;
             pr->remaining = next_node_idx;
             pr->kv_count = 0;
+            pr->deadline_ms = now_ms() + PENDING_READ_TIMEOUT_MS;
 
             for (usize i = 0; i < next_node_idx; ++i) {
                 cJSON *res_body = cJSON_CreateObject();
