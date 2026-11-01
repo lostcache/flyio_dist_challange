@@ -9,7 +9,6 @@
 #include <string.h>
 #include <sys/random.h>
 #include <sys/time.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "types.h"
@@ -30,6 +29,30 @@ _Static_assert((LOG_RING_BUF_SIZE & (LOG_RING_BUF_SIZE - 1)) == 0,
 #define MAX_KV_ENTRIES 4096
 #define MAX_KV_KEY_LEN 16
 #define KV_BUF_SIZE 1024
+
+static const u8 ERR_MALFORMED_INIT[] = "malformed init message";
+static const u8 ERR_NODE_ID_TOO_LONG[] = "node id too long";
+static const u8 ERR_ECHO_TYPE[] = "incorrect echo type";
+static const u8 ERR_GENERATE_BEFORE_INIT[] = "generate received before init";
+static const u8 ERR_GENERATE_ID[] = "could not build generate id";
+static const u8 ERR_BROADCAST_FULL[] = "broadcast buffer full";
+static const u8 ERR_BROADCAST_TYPE[] = "incorrect broadcast type";
+static const u8 ERR_TOO_MANY_PENDING_READS[] = "too many pending reads";
+static const u8 ERR_TOPOLOGY_TYPE[] = "incorrect topology type";
+static const u8 ERR_INVALID_ADD[] = "invalid add msg";
+static const u8 ERR_TOO_MANY_PENDING_ADDS[] = "too many pending adds";
+static const u8 ERR_MALFORMED_SEND[] = "malformed send message";
+static const u8 ERR_KEY_TOO_LONG[] = "key too long";
+static const u8 ERR_TOO_MANY_LOGS[] = "can not support more logs";
+static const u8 ERR_LOG_FULL[] = "ran out of buffer space";
+static const u8 ERR_MALFORMED_POLL[] = "malformed poll request";
+static const u8 ERR_INVALID_READ[] = "invalid read";
+static const u8 ERR_MALFORMED_COMMIT[] = "malformed commit msg";
+static const u8 ERR_MALFORMED_LIST[] = "malformed list committed msg";
+static const u8 ERR_KV_FULL[] = "kv table full";
+static const u8 ERR_MALFORMED_TXN[] = "malformed txn msg";
+static const u8 ERR_NOT_SUPPORTED[] = "not supported";
+static const u8 ERR_TIMEOUT[] = "timeout";
 
 typedef struct {
     i32 msg_vals[4096];
@@ -197,8 +220,7 @@ static void reap_pending_reads(i64 now, const u8 *node_id, u64 *next_msg_id) {
         if (!pr->used || now < pr->deadline_ms) {
             continue;
         }
-        send_error(node_id, pr->client_src, (*next_msg_id)++, pr->client_msg_id, 0,
-                   (const u8 *)"timeout");
+        send_error(node_id, pr->client_src, (*next_msg_id)++, pr->client_msg_id, 0, ERR_TIMEOUT);
         pr->used = false;
     }
 }
@@ -437,7 +459,7 @@ int main(void) {
         if (!strcmp(type->valuestring, "init")) {
             if (!cJSON_HasObjectItem(body, "node_id") || !cJSON_HasObjectItem(body, "node_ids")) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"correct init type");
+                           next_msg_id++, in_reply_to, 69, ERR_MALFORMED_INIT);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -448,7 +470,7 @@ int main(void) {
             if (!cJSON_IsString(node_id) || node_id->valuestring == NULL ||
                 !cJSON_IsArray(node_ids)) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"correct init type");
+                           next_msg_id++, in_reply_to, 69, ERR_MALFORMED_INIT);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -456,7 +478,7 @@ int main(void) {
             usize node_id_len = strlen(node_id->valuestring);
             if (node_id_len >= sizeof NODE_ID) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 12, (const u8 *)"node id too long");
+                           next_msg_id++, in_reply_to, 12, ERR_NODE_ID_TOO_LONG);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -474,7 +496,7 @@ int main(void) {
             }
             if (node_ids_too_long) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 12, (const u8 *)"node id too long");
+                           next_msg_id++, in_reply_to, 12, ERR_NODE_ID_TOO_LONG);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -500,7 +522,7 @@ int main(void) {
             const cJSON *echo = cJSON_GetObjectItem(body, "echo");
             if (!cJSON_IsString(echo) || echo->valuestring == NULL) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 13, (const u8 *)"incorrect echo type");
+                           next_msg_id++, in_reply_to, 13, ERR_ECHO_TYPE);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -515,8 +537,7 @@ int main(void) {
         } else if (!strcmp(type->valuestring, "generate")) {
             if (!node_id_set) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69,
-                           (const u8 *)"generate received before init");
+                           next_msg_id++, in_reply_to, 69, ERR_GENERATE_BEFORE_INIT);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -541,8 +562,7 @@ int main(void) {
                                   (long long)now, (int)GENERATE_MS_COUNTER);
             if (id_len < 0 || (usize)id_len >= sizeof id) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 13,
-                           (const u8 *)"could not build generate id");
+                           next_msg_id++, in_reply_to, 13, ERR_GENERATE_ID);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -555,14 +575,14 @@ int main(void) {
         } else if (!strcmp(type->valuestring, "broadcast")) {
             if (bd_msg.size >= bd_msg.cap) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 11, (const u8 *)"broadcast buffer full");
+                           next_msg_id++, in_reply_to, 11, ERR_BROADCAST_FULL);
                 cJSON_Delete(msg_json);
                 continue;
             }
 
             if (!cJSON_HasObjectItem(body, "message")) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"incorrect broadcast type");
+                           next_msg_id++, in_reply_to, 69, ERR_BROADCAST_TYPE);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -570,7 +590,7 @@ int main(void) {
             const cJSON *msg_val = cJSON_GetObjectItem(body, "message");
             if (!cJSON_IsNumber(msg_val)) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"incorrect broadcast type");
+                           next_msg_id++, in_reply_to, 69, ERR_BROADCAST_TYPE);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -593,7 +613,7 @@ int main(void) {
             PendingKVReadAll *pr = alloc_pending_kv_read_all();
             if (!pr) {
                 send_error(NODE_ID, (const u8 *)src->valuestring, next_msg_id++, in_reply_to, 11,
-                           (const u8 *)"too many pending reads");
+                           ERR_TOO_MANY_PENDING_READS);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -627,7 +647,7 @@ int main(void) {
         } else if (!strcmp(type->valuestring, "topology")) {
             if (!cJSON_HasObjectItem(body, "topology")) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"incorrect topology type");
+                           next_msg_id++, in_reply_to, 69, ERR_TOPOLOGY_TYPE);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -637,7 +657,7 @@ int main(void) {
         } else if (!strcmp(type->valuestring, "add")) {
             if (!cJSON_HasObjectItem(body, "delta")) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"invalid add msg");
+                           next_msg_id++, in_reply_to, 69, ERR_INVALID_ADD);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -645,7 +665,7 @@ int main(void) {
             cJSON *delta_obj = cJSON_GetObjectItem(body, "delta");
             if (!cJSON_IsNumber(delta_obj)) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"invalid add msg");
+                           next_msg_id++, in_reply_to, 69, ERR_INVALID_ADD);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -653,7 +673,7 @@ int main(void) {
             PendingKVAdd *pa = alloc_pending_read();
             if (!pa) {
                 send_error(NODE_ID, (const u8 *)src->valuestring, next_msg_id++, in_reply_to, 11,
-                           (const u8 *)"too many pending adds");
+                           ERR_TOO_MANY_PENDING_ADDS);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -680,7 +700,7 @@ int main(void) {
         } else if (!strcmp(type->valuestring, "send")) {
             if (!cJSON_HasObjectItem(body, "key") || !cJSON_HasObjectItem(body, "msg")) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"malformed send message/n");
+                           next_msg_id++, in_reply_to, 69, ERR_MALFORMED_SEND);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -691,7 +711,7 @@ int main(void) {
             if (!cJSON_IsString(key_obj) || key_obj->valuestring == NULL ||
                 !cJSON_IsNumber(msg_obj)) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"malformed send message/n");
+                           next_msg_id++, in_reply_to, 69, ERR_MALFORMED_SEND);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -699,7 +719,7 @@ int main(void) {
             usize key_len = strlen(key_obj->valuestring);
             if (key_len >= MAX_LOG_KEY_LEN) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 12, (const u8 *)"key too long");
+                           next_msg_id++, in_reply_to, 12, ERR_KEY_TOO_LONG);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -709,8 +729,7 @@ int main(void) {
             if (log_idx == -1) {
                 if (lb->next_log_idx >= MAX_LOGS) {
                     send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                               next_msg_id++, in_reply_to, 11,
-                               (const u8 *)"can not support more logs/n");
+                               next_msg_id++, in_reply_to, 11, ERR_TOO_MANY_LOGS);
                     cJSON_Delete(msg_json);
                     continue;
                 }
@@ -721,7 +740,7 @@ int main(void) {
 
             if (lb->next_log_offsets[log_idx] >= LOG_RING_BUF_SIZE) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 11, (const u8 *)"ran out of buffer space/n");
+                           next_msg_id++, in_reply_to, 11, ERR_LOG_FULL);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -742,7 +761,7 @@ int main(void) {
             cJSON *offsets_obj = cJSON_GetObjectItem(body, "offsets");
             if (!cJSON_IsObject(offsets_obj)) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"malformed poll request/n");
+                           next_msg_id++, in_reply_to, 69, ERR_MALFORMED_POLL);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -763,8 +782,7 @@ int main(void) {
                 const char *key = it->string;
                 if (key == NULL || !cJSON_IsNumber(it)) {
                     send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                               next_msg_id++, in_reply_to, 69,
-                               (const u8 *)"malformed poll request/n");
+                               next_msg_id++, in_reply_to, 69, ERR_MALFORMED_POLL);
                     error_during_iterarion = true;
                     break;
                 }
@@ -778,7 +796,7 @@ int main(void) {
 
                 if (offset > lb->next_log_offsets[log_idx]) {
                     send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                               next_msg_id++, in_reply_to, 69, (const u8 *)"invalid read/n");
+                               next_msg_id++, in_reply_to, 69, ERR_INVALID_READ);
                     error_during_iterarion = true;
                     break;
                 }
@@ -846,7 +864,7 @@ int main(void) {
             cJSON *offsets_obj = cJSON_GetObjectItem(body, "offsets");
             if (!cJSON_IsObject(offsets_obj)) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"malformed commit msg/n");
+                           next_msg_id++, in_reply_to, 69, ERR_MALFORMED_COMMIT);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -857,8 +875,7 @@ int main(void) {
                 const u8 *key = (const u8 *)it->string;
                 if (key == NULL || !cJSON_IsNumber(it)) {
                     send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                               next_msg_id++, in_reply_to, 69,
-                               (const u8 *)"malformed commit msg/n");
+                               next_msg_id++, in_reply_to, 69, ERR_MALFORMED_COMMIT);
                     malformed = true;
                     break;
                 }
@@ -890,8 +907,7 @@ int main(void) {
             cJSON *keys_arr_obj = cJSON_GetObjectItem(body, "keys");
             if (!keys_arr_obj || !cJSON_IsArray(keys_arr_obj)) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69,
-                           (const u8 *)"malformed list committed msg/n");
+                           next_msg_id++, in_reply_to, 69, ERR_MALFORMED_LIST);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -929,8 +945,7 @@ int main(void) {
 
             if (error_in_for_loop) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69,
-                           (const u8 *)"malformed list committed msg/n");
+                           next_msg_id++, in_reply_to, 69, ERR_MALFORMED_LIST);
                 cJSON_Delete(msg_json);
                 cJSON_Delete(res_body);
                 continue;
@@ -941,7 +956,7 @@ int main(void) {
             cJSON *txn_arr_obj = cJSON_GetObjectItem(body, "txn");
             if (!txn_arr_obj || !cJSON_IsArray(txn_arr_obj)) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"malformed txn msg/n");
+                           next_msg_id++, in_reply_to, 69, ERR_MALFORMED_TXN);
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -1063,7 +1078,7 @@ int main(void) {
 
             if (kv_full) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 11, (const u8 *)"kv table full");
+                           next_msg_id++, in_reply_to, 11, ERR_KV_FULL);
                 cJSON_Delete(msg_json);
                 cJSON_Delete(res_body);
                 continue;
@@ -1071,7 +1086,7 @@ int main(void) {
 
             if (error_in_foreach) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"malformed txn msg/n");
+                           next_msg_id++, in_reply_to, 69, ERR_MALFORMED_TXN);
                 cJSON_Delete(msg_json);
                 cJSON_Delete(res_body);
                 continue;
@@ -1080,7 +1095,7 @@ int main(void) {
             send((const u8 *)dest->valuestring, (const u8 *)src->valuestring, res_body);
         } else {
             send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring, next_msg_id++,
-                       in_reply_to, 10, (const u8 *)"not supported");
+                       in_reply_to, 10, ERR_NOT_SUPPORTED);
             cJSON_Delete(msg_json);
             continue;
         }
