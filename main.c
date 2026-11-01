@@ -19,6 +19,9 @@
 #define MAX_LOG_KEY_LEN 16
 #define LOG_RING_BUF_SIZE 128
 
+_Static_assert((LOG_RING_BUF_SIZE & (LOG_RING_BUF_SIZE - 1)) == 0,
+               "LOG_RING_BUF_SIZE must be a power of two");
+
 #define MAX_KV_ENTRIES 4096
 #define MAX_KV_KEY_LEN 16
 #define KV_BUF_SIZE 1024
@@ -84,9 +87,6 @@ static PendingKVReadAll *find_pending_kv_read_all(u64 kv_msg_id) {
 typedef struct {
     u8 keys[MAX_LOGS][MAX_LOG_KEY_LEN];
     i64 logs[MAX_LOGS][LOG_RING_BUF_SIZE];
-    usize used_start_idx[MAX_LOGS];
-    usize empty_idx[MAX_LOGS];
-    usize log_entries_count[MAX_LOGS];
     usize next_log_idx;
     u64 next_log_offsets[MAX_LOGS];
     u64 uncomitted_offset_start[MAX_LOGS];
@@ -558,7 +558,7 @@ int main(void) {
             i64 log_idx = find_log_idx_by_key(lb, (const u8 *)key_obj->valuestring);
 
             if (log_idx == -1) {
-                if (lb->next_log_idx + 1 >= MAX_LOGS) {
+                if (lb->next_log_idx >= MAX_LOGS) {
                     send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
                                next_msg_id++, in_reply_to, 69,
                                (const u8 *)"can not support more logs/n");
@@ -570,15 +570,15 @@ int main(void) {
                 snprintf((char *)lb->keys[log_idx], MAX_LOG_KEY_LEN, "%s", key_obj->valuestring);
             }
 
-            if (lb->log_entries_count[log_idx] >= LOG_RING_BUF_SIZE) {
+            if (lb->next_log_offsets[log_idx] >= LOG_RING_BUF_SIZE) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
                            next_msg_id++, in_reply_to, 69, (const u8 *)"ran out of buffer space/n");
                 cJSON_Delete(msg_json);
                 continue;
             }
 
-            lb->logs[log_idx][lb->empty_idx[log_idx]++] = (i64)msg_obj->valuedouble;
-            ++lb->log_entries_count[log_idx];
+            lb->logs[log_idx][lb->next_log_offsets[log_idx] & (LOG_RING_BUF_SIZE - 1)] =
+                (i64)msg_obj->valuedouble;
             ++lb->next_log_offsets[log_idx];
 
             cJSON *res_body = reply_body(next_msg_id++, (const u8 *)"send_ok", in_reply_to);
@@ -642,34 +642,11 @@ int main(void) {
                     continue;
                 }
 
-                if (lb->next_log_offsets[log_idx] - offset > LOG_RING_BUF_SIZE) {
+                if (offset > lb->next_log_offsets[log_idx]) {
                     send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                               next_msg_id++, in_reply_to, 69,
-                               (const u8 *)"ran out of buffer space/n");
+                               next_msg_id++, in_reply_to, 69, (const u8 *)"invalid read/n");
                     error_during_iterarion = true;
                     break;
-                }
-
-                usize start_idx = offset % LOG_RING_BUF_SIZE,
-                      end_idx = lb->next_log_offsets[log_idx] % LOG_RING_BUF_SIZE - 1;
-                if (lb->empty_idx[log_idx] > lb->used_start_idx[log_idx]) {
-                    if (start_idx < lb->used_start_idx[log_idx] ||
-                        end_idx >= lb->empty_idx[log_idx]) {
-                        send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                                   next_msg_id++, in_reply_to, 69, (const u8 *)"invalid read/n");
-                        error_during_iterarion = true;
-                        break;
-                    }
-                } else {
-                    if ((start_idx < lb->used_start_idx[log_idx] &&
-                         start_idx >= lb->empty_idx[log_idx]) ||
-                        (end_idx < lb->used_start_idx[log_idx] &&
-                         end_idx >= lb->empty_idx[log_idx])) {
-                        send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                                   next_msg_id++, in_reply_to, 69, (const u8 *)"invalid read/n");
-                        error_during_iterarion = true;
-                        break;
-                    }
                 }
 
                 cJSON *log_res_arr = cJSON_AddArrayToObject(msgs_obj, key);
@@ -682,7 +659,7 @@ int main(void) {
 
                 bool error_in_for_loop = false;
                 for (u64 i = offset; i < lb->next_log_offsets[log_idx]; ++i) {
-                    u64 idx = i % LOG_RING_BUF_SIZE;
+                    u64 idx = i & (LOG_RING_BUF_SIZE - 1);
                     cJSON *res_offset_obj = cJSON_CreateNumber((double)i);
                     if (!res_offset_obj) {
                         error_in_for_loop = true;
