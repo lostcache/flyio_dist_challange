@@ -202,6 +202,12 @@ int main(void) {
             continue;
         }
 
+        if (!cJSON_IsObject(msg_json)) {
+            fprintf(stderr, "message is not a JSON object\n");
+            cJSON_Delete(msg_json);
+            continue;
+        }
+
         const cJSON *src, *dest, *body, *type, *msg_id;
 
         if (!cJSON_HasObjectItem(msg_json, "src") || !cJSON_HasObjectItem(msg_json, "dest") ||
@@ -217,18 +223,19 @@ int main(void) {
 
         // TODO: validate lengths
         body = cJSON_GetObjectItem(msg_json, "body");
-        if (!cJSON_IsString(src) || !cJSON_IsString(dest) || !cJSON_IsObject(body)) {
+        if (!cJSON_IsString(src) || src->valuestring == NULL || !cJSON_IsString(dest) ||
+            dest->valuestring == NULL || !cJSON_IsObject(body)) {
             fprintf(stderr, "incorrect type for src, dest or body\n");
             cJSON_Delete(msg_json);
             continue;
         }
 
-        if (!cJSON_HasObjectItem(body, "type")) {
-            fprintf(stderr, "field/s type not found\n");
+        type = cJSON_GetObjectItem(body, "type");
+        if (!cJSON_IsString(type) || type->valuestring == NULL) {
+            fprintf(stderr, "field/s type not found or not a string\n");
             cJSON_Delete(msg_json);
             continue;
         }
-        type = cJSON_GetObjectItem(body, "type");
 
         if (!strcmp(type->valuestring, "read_ok")) {
             if (!cJSON_HasObjectItem(body, "value")) {
@@ -236,19 +243,25 @@ int main(void) {
                 continue;
             }
             cJSON *value_ptr = cJSON_GetObjectItem(body, "value");
-            double value = value_ptr->valuedouble;
-
-            if (!cJSON_HasObjectItem(body, "in_reply_to")) {
+            if (!cJSON_IsNumber(value_ptr)) {
                 cJSON_Delete(msg_json);
                 continue;
             }
+
+            double value = value_ptr->valuedouble;
+
             cJSON *reply_ptr = cJSON_GetObjectItem(body, "in_reply_to");
+            if (!cJSON_IsNumber(reply_ptr)) {
+                cJSON_Delete(msg_json);
+                continue;
+            }
             u64 in_reply_to = (u64)reply_ptr->valuedouble;
 
             PendingKVReadAll *pr = find_pending_kv_read_all(in_reply_to);
-
-            if (!pr)
+            if (!pr) {
+                cJSON_Delete(msg_json);
                 continue;
+            }
 
             pr->sum += (i64)value;
             if (--pr->remaining == 0) {
@@ -258,15 +271,16 @@ int main(void) {
                 pr->used = 0;
             }
 
+            cJSON_Delete(msg_json);
             continue;
         }
 
         if (!strcmp(type->valuestring, "write_ok")) {
-            if (!cJSON_HasObjectItem(body, "in_reply_to")) {
+            cJSON *reply_ptr = cJSON_GetObjectItem(body, "in_reply_to");
+            if (!cJSON_IsNumber(reply_ptr)) {
                 cJSON_Delete(msg_json);
                 continue;
             }
-            cJSON *reply_ptr = cJSON_GetObjectItem(body, "in_reply_to");
             u64 in_reply_to = (u64)reply_ptr->valuedouble;
 
             PendingKVAdd *p = find_pending_add(in_reply_to);
@@ -281,11 +295,11 @@ int main(void) {
         }
 
         if (!strcmp(type->valuestring, "error")) {
-            if (!cJSON_HasObjectItem(body, "in_reply_to")) {
+            cJSON *reply_ptr = cJSON_GetObjectItem(body, "in_reply_to");
+            if (!cJSON_IsNumber(reply_ptr)) {
                 cJSON_Delete(msg_json);
                 continue;
             }
-            cJSON *reply_ptr = cJSON_GetObjectItem(body, "in_reply_to");
             u64 in_reply_to = (u64)reply_ptr->valuedouble;
 
             const cJSON *code_ptr = cJSON_GetObjectItem(body, "code");
@@ -325,7 +339,8 @@ int main(void) {
             cJSON *node_id = cJSON_GetObjectItem(body, "node_id"),
                   *node_ids = cJSON_GetObjectItem(body, "node_ids");
 
-            if (!cJSON_IsString(node_id) || !cJSON_IsArray(node_ids)) {
+            if (!cJSON_IsString(node_id) || node_id->valuestring == NULL ||
+                !cJSON_IsArray(node_ids)) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
                            next_msg_id++, in_reply_to, 69, (const u8 *)"correct init type");
                 cJSON_Delete(msg_json);
@@ -344,7 +359,7 @@ int main(void) {
 
             cJSON *it = NULL;
             cJSON_ArrayForEach(it, node_ids) {
-                if (!cJSON_IsString(it)) {
+                if (!cJSON_IsString(it) || it->valuestring == NULL) {
                     continue;
                 }
                 if (next_node_idx >= MAX_NODES) {
@@ -358,7 +373,7 @@ int main(void) {
             send((const u8 *)dest->valuestring, (const u8 *)src->valuestring, res_body);
         } else if (!strcmp(type->valuestring, "echo")) {
             const cJSON *echo = cJSON_GetObjectItem(body, "echo");
-            if (!cJSON_IsString(echo)) {
+            if (!cJSON_IsString(echo) || echo->valuestring == NULL) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
                            next_msg_id++, in_reply_to, 13, (const u8 *)"incorrect echo type");
                 cJSON_Delete(msg_json);
@@ -532,7 +547,8 @@ int main(void) {
             cJSON *key_obj = cJSON_GetObjectItem(body, "key"),
                   *msg_obj = cJSON_GetObjectItem(body, "msg");
 
-            if (!cJSON_IsString(key_obj) || !cJSON_IsNumber(msg_obj)) {
+            if (!cJSON_IsString(key_obj) || key_obj->valuestring == NULL ||
+                !cJSON_IsNumber(msg_obj)) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
                            next_msg_id++, in_reply_to, 69, (const u8 *)"malformed send message/n");
                 cJSON_Delete(msg_json);
@@ -578,14 +594,14 @@ int main(void) {
 
             send((const u8 *)dest->valuestring, (const u8 *)src->valuestring, res_body);
         } else if (!strcmp(type->valuestring, "poll")) {
-            if (!cJSON_HasObjectItem(body, "offsets")) {
+            cJSON *offsets_obj = cJSON_GetObjectItem(body, "offsets");
+            if (!cJSON_IsObject(offsets_obj)) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
                            next_msg_id++, in_reply_to, 69, (const u8 *)"malformed poll request/n");
                 cJSON_Delete(msg_json);
                 continue;
             }
 
-            cJSON *offsets_obj = cJSON_GetObjectItem(body, "offsets");
             cJSON *offset_items = offsets_obj->child;
 
             cJSON *poll_res_obj = reply_body(next_msg_id++, (const u8 *)"poll_ok", in_reply_to);
@@ -611,6 +627,13 @@ int main(void) {
             cJSON *it = offset_items;
             while (it) {
                 const char *key = it->string;
+                if (key == NULL || !cJSON_IsNumber(it)) {
+                    send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
+                               next_msg_id++, in_reply_to, 69,
+                               (const u8 *)"malformed poll request/n");
+                    error_during_iterarion = true;
+                    break;
+                }
                 const u64 offset = (u64)it->valuedouble;
 
                 i64 log_idx = find_log_idx_by_key(lb, (const u8 *)key);
@@ -710,7 +733,7 @@ int main(void) {
             send((const u8 *)dest->valuestring, (const u8 *)src->valuestring, poll_res_obj);
         } else if (!strcmp(type->valuestring, "commit_offsets")) {
             cJSON *offsets_obj = cJSON_GetObjectItem(body, "offsets");
-            if (!offsets_obj) {
+            if (!cJSON_IsObject(offsets_obj)) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
                            next_msg_id++, in_reply_to, 69, (const u8 *)"malformed commit msg/n");
                 cJSON_Delete(msg_json);
@@ -718,8 +741,16 @@ int main(void) {
             }
 
             cJSON *it = offsets_obj->child;
+            bool malformed = false;
             while (it) {
                 const u8 *key = (const u8 *)it->string;
+                if (key == NULL || !cJSON_IsNumber(it)) {
+                    send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
+                               next_msg_id++, in_reply_to, 69,
+                               (const u8 *)"malformed commit msg/n");
+                    malformed = true;
+                    break;
+                }
                 const u64 offset_val = (u64)it->valuedouble;
 
                 i64 log_idx = find_log_idx_by_key(lb, key);
@@ -734,6 +765,11 @@ int main(void) {
                 }
 
                 it = it->next;
+            }
+
+            if (malformed) {
+                cJSON_Delete(msg_json);
+                continue;
             }
 
             cJSON *res_body =
@@ -770,7 +806,7 @@ int main(void) {
             cJSON *it;
             bool error_in_for_loop = false;
             cJSON_ArrayForEach(it, keys_arr_obj) {
-                if (!cJSON_IsString(it)) {
+                if (!cJSON_IsString(it) || it->valuestring == NULL) {
                     error_in_for_loop = true;
                     break;
                 }
@@ -828,7 +864,8 @@ int main(void) {
                 cJSON *op = cJSON_GetArrayItem(it, 0), *key = cJSON_GetArrayItem(it, 1),
                       *val = cJSON_GetArrayItem(it, 2);
 
-                if (!op || !cJSON_IsString(op) || !key || !cJSON_IsNumber(key)) {
+                if (!op || !cJSON_IsString(op) || op->valuestring == NULL || !key ||
+                    !cJSON_IsNumber(key)) {
                     error_in_foreach = true;
                     break;
                 }
