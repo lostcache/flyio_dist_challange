@@ -487,7 +487,7 @@ int main(void) {
         } else if (!strcmp(type->valuestring, "broadcast")) {
             if (bd_msg.size >= bd_msg.cap) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"broadcast buffer full");
+                           next_msg_id++, in_reply_to, 11, (const u8 *)"broadcast buffer full");
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -524,7 +524,7 @@ int main(void) {
 
             PendingKVReadAll *pr = alloc_pending_kv_read_all();
             if (!pr) {
-                send_error(NODE_ID, (const u8 *)src->valuestring, next_msg_id++, in_reply_to, 13,
+                send_error(NODE_ID, (const u8 *)src->valuestring, next_msg_id++, in_reply_to, 11,
                            (const u8 *)"too many pending reads");
                 cJSON_Delete(msg_json);
                 continue;
@@ -583,7 +583,7 @@ int main(void) {
 
             PendingKVAdd *pa = alloc_pending_read();
             if (!pa) {
-                send_error(NODE_ID, (const u8 *)src->valuestring, next_msg_id++, in_reply_to, 13,
+                send_error(NODE_ID, (const u8 *)src->valuestring, next_msg_id++, in_reply_to, 11,
                            (const u8 *)"too many pending adds");
                 cJSON_Delete(msg_json);
                 continue;
@@ -640,7 +640,7 @@ int main(void) {
             if (log_idx == -1) {
                 if (lb->next_log_idx >= MAX_LOGS) {
                     send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                               next_msg_id++, in_reply_to, 69,
+                               next_msg_id++, in_reply_to, 11,
                                (const u8 *)"can not support more logs/n");
                     cJSON_Delete(msg_json);
                     continue;
@@ -652,7 +652,7 @@ int main(void) {
 
             if (lb->next_log_offsets[log_idx] >= LOG_RING_BUF_SIZE) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 69, (const u8 *)"ran out of buffer space/n");
+                           next_msg_id++, in_reply_to, 11, (const u8 *)"ran out of buffer space/n");
                 cJSON_Delete(msg_json);
                 continue;
             }
@@ -994,7 +994,7 @@ int main(void) {
 
             if (kv_full) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
-                           next_msg_id++, in_reply_to, 13, (const u8 *)"kv table full");
+                           next_msg_id++, in_reply_to, 11, (const u8 *)"kv table full");
                 cJSON_Delete(msg_json);
                 cJSON_Delete(res_body);
                 continue;
@@ -1019,6 +1019,14 @@ int main(void) {
         cJSON_Delete(msg_json);
     }
 
+    if (ferror(stdin)) {
+        fprintf(stderr, "could not read stdin\n");
+        free(kvs);
+        free(lb);
+        return EXIT_FAILURE;
+    }
+
+    free(kvs);
     free(lb);
-    return 0;
+    return EXIT_SUCCESS;
 }
