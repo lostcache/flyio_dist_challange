@@ -217,15 +217,19 @@ int main(void) {
             continue;
         }
 
-        // TODO: validate lengths
         src = cJSON_GetObjectItem(msg_json, "src");
         dest = cJSON_GetObjectItem(msg_json, "dest");
-
-        // TODO: validate lengths
         body = cJSON_GetObjectItem(msg_json, "body");
         if (!cJSON_IsString(src) || src->valuestring == NULL || !cJSON_IsString(dest) ||
             dest->valuestring == NULL || !cJSON_IsObject(body)) {
             fprintf(stderr, "incorrect type for src, dest or body\n");
+            cJSON_Delete(msg_json);
+            continue;
+        }
+
+        if (strlen(src->valuestring) >= MAX_NODE_NAME_LEN ||
+            strlen(dest->valuestring) >= MAX_NODE_NAME_LEN) {
+            fprintf(stderr, "src or dest too long\n");
             cJSON_Delete(msg_json);
             continue;
         }
@@ -347,17 +351,35 @@ int main(void) {
                 continue;
             }
 
-            if (strlen(node_id->valuestring) >= sizeof NODE_ID) {
+            usize node_id_len = strlen(node_id->valuestring);
+            if (node_id_len >= sizeof NODE_ID) {
                 send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
                            next_msg_id++, in_reply_to, 12, (const u8 *)"node id too long");
                 cJSON_Delete(msg_json);
                 continue;
             }
-            usize node_id_len = strlen(node_id->valuestring);
+
+            bool node_ids_too_long = false;
+            cJSON *it = NULL;
+            cJSON_ArrayForEach(it, node_ids) {
+                if (!cJSON_IsString(it) || it->valuestring == NULL) {
+                    continue;
+                }
+                if (strlen(it->valuestring) >= MAX_NODE_NAME_LEN) {
+                    node_ids_too_long = true;
+                    break;
+                }
+            }
+            if (node_ids_too_long) {
+                send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
+                           next_msg_id++, in_reply_to, 12, (const u8 *)"node id too long");
+                cJSON_Delete(msg_json);
+                continue;
+            }
+
             memcpy(NODE_ID, node_id->valuestring, node_id_len + 1);
             node_id_set = true;
 
-            cJSON *it = NULL;
             cJSON_ArrayForEach(it, node_ids) {
                 if (!cJSON_IsString(it) || it->valuestring == NULL) {
                     continue;
@@ -365,7 +387,8 @@ int main(void) {
                 if (next_node_idx >= MAX_NODES) {
                     break;
                 }
-                snprintf((char *)NODE_IDS[next_node_idx], MAX_NODE_NAME_LEN, "%s", it->valuestring);
+                usize name_len = strlen(it->valuestring);
+                memcpy(NODE_IDS[next_node_idx], it->valuestring, name_len + 1);
                 ++next_node_idx;
             }
 
@@ -409,8 +432,15 @@ int main(void) {
                 GENERATE_MS_COUNTER = 0;
             }
             u8 id[64];
-            snprintf((char *)id, sizeof id, "%s-%lld-%d", (const char *)NODE_ID, (long long)now,
-                     (int)GENERATE_MS_COUNTER);
+            int id_len = snprintf((char *)id, sizeof id, "%s-%lld-%d", (const char *)NODE_ID,
+                                  (long long)now, (int)GENERATE_MS_COUNTER);
+            if (id_len < 0 || (usize)id_len >= sizeof id) {
+                send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
+                           next_msg_id++, in_reply_to, 13,
+                           (const u8 *)"could not build generate id");
+                cJSON_Delete(msg_json);
+                continue;
+            }
             cJSON *res_body = reply_body(next_msg_id++, (const u8 *)"generate_ok", in_reply_to);
             cJSON_AddStringToObject(res_body, "id", (const char *)id);
             send((const u8 *)dest->valuestring, (const u8 *)src->valuestring, res_body);
@@ -460,7 +490,8 @@ int main(void) {
 
             pr->used = true;
             pr->client_msg_id = in_reply_to;
-            snprintf((char *)pr->client_src, sizeof pr->client_src, "%s", src->valuestring);
+            usize src_len = strlen(src->valuestring);
+            memcpy(pr->client_src, src->valuestring, src_len + 1);
             pr->sum = 0;
             pr->remaining = next_node_idx;
             pr->kv_count = 0;
@@ -527,7 +558,8 @@ int main(void) {
             pa->used = true;
             pa->kv_msg_id = next_msg_id++;
             pa->client_msg_id = in_reply_to;
-            snprintf((char *)pa->client_src, sizeof pa->client_src, "%s", src->valuestring);
+            usize src_len = strlen(src->valuestring);
+            memcpy(pa->client_src, src->valuestring, src_len + 1);
 
             counter += (i64)delta_obj->valuedouble;
             cJSON *res_body = cJSON_CreateObject();
@@ -555,6 +587,14 @@ int main(void) {
                 continue;
             }
 
+            usize key_len = strlen(key_obj->valuestring);
+            if (key_len >= MAX_LOG_KEY_LEN) {
+                send_error((const u8 *)dest->valuestring, (const u8 *)src->valuestring,
+                           next_msg_id++, in_reply_to, 12, (const u8 *)"key too long");
+                cJSON_Delete(msg_json);
+                continue;
+            }
+
             i64 log_idx = find_log_idx_by_key(lb, (const u8 *)key_obj->valuestring);
 
             if (log_idx == -1) {
@@ -567,7 +607,7 @@ int main(void) {
                 }
 
                 log_idx = (i64)lb->next_log_idx++;
-                snprintf((char *)lb->keys[log_idx], MAX_LOG_KEY_LEN, "%s", key_obj->valuestring);
+                memcpy(lb->keys[log_idx], key_obj->valuestring, key_len + 1);
             }
 
             if (lb->next_log_offsets[log_idx] >= LOG_RING_BUF_SIZE) {
