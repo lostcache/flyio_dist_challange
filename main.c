@@ -207,28 +207,31 @@ static void response_free(PendingResponseArr *res) {
     res->count = 0;
 }
 
-static ServerContext *server_context_new(void) {
+static int server_context_new(ServerContext **out) {
+    *out = NULL;
+
     ServerContext *ctx = calloc(1, sizeof *ctx);
     if (!ctx) {
-        return NULL;
+        return -ENOMEM;
     }
 
     ctx->lb = calloc(1, sizeof *ctx->lb);
     if (!ctx->lb) {
         free(ctx);
-        return NULL;
+        return -ENOMEM;
     }
 
     ctx->kvs = calloc(1, sizeof *ctx->kvs);
     if (!ctx->kvs) {
         free(ctx->lb);
         free(ctx);
-        return NULL;
+        return -ENOMEM;
     }
 
     ctx->bd_msg.cap = 4096;
     ctx->next_msg_id = 1;
-    return ctx;
+    *out = ctx;
+    return 0;
 }
 
 static void server_context_free(ServerContext *ctx) {
@@ -240,54 +243,60 @@ static void server_context_free(ServerContext *ctx) {
     free(ctx);
 }
 
-static PendingKVAdd *find_pending_add(ServerContext *ctx, u64 kv_msg_id) {
+static bool find_pending_add(ServerContext *ctx, u64 kv_msg_id, PendingKVAdd **out) {
     for (usize i = 0; i < MAX_PENDING; ++i) {
         if (ctx->pending_adds[i].used && ctx->pending_adds[i].kv_msg_id == kv_msg_id) {
-            return &ctx->pending_adds[i];
+            *out = &ctx->pending_adds[i];
+            return true;
         }
     }
-    return NULL;
+    return false;
 }
 
-static PendingKVReadAll *alloc_pending_kv_read_all(ServerContext *ctx) {
+static int alloc_pending_kv_read_all(ServerContext *ctx, PendingKVReadAll **out) {
+    *out = NULL;
     for (usize i = 0; i < MAX_PENDING; ++i) {
         if (!ctx->pending_read_alls[i].used) {
-            return &ctx->pending_read_alls[i];
+            *out = &ctx->pending_read_alls[i];
+            return 0;
         }
     }
-    return NULL;
+    return -ENOSPC;
 }
 
-static PendingKVReadAll *find_pending_kv_read_all(ServerContext *ctx, u64 kv_msg_id) {
+static bool find_pending_kv_read_all(ServerContext *ctx, u64 kv_msg_id, PendingKVReadAll **out) {
     for (usize i = 0; i < MAX_PENDING; ++i) {
         if (!ctx->pending_read_alls[i].used) {
             continue;
         }
         for (usize j = 0; j < ctx->pending_read_alls[i].kv_count; ++j) {
             if (ctx->pending_read_alls[i].kv_read_msg_ids[j] == kv_msg_id) {
-                return &ctx->pending_read_alls[i];
+                *out = &ctx->pending_read_alls[i];
+                return true;
             }
         }
     }
-    return NULL;
+    return false;
 }
 
-static i64 find_log_idx_by_key(LogBuffers *lb, const u8 *key) {
+static bool find_log_idx_by_key(LogBuffers *lb, const u8 *key, usize *out) {
     for (usize i = 0; i < lb->next_log_idx; ++i) {
         if (!strncmp((const char *)key, (const char *)lb->keys[i], MAX_LOG_KEY_LEN)) {
-            return (i64)i;
+            *out = i;
+            return true;
         }
     }
-    return -1;
+    return false;
 }
 
-static i64 find_kv_entry_idx_by_key(KVStore *kvs, i64 key) {
+static bool find_kv_entry_idx_by_key(KVStore *kvs, i64 key, usize *out) {
     for (usize i = 0; i < kvs->empty_idx; ++i) {
         if (kvs->keys[i] == key) {
-            return (i64)i;
+            *out = i;
+            return true;
         }
     }
-    return -1;
+    return false;
 }
 
 // Answers expired pending reads with a timeout error and releases their slots.
@@ -303,8 +312,8 @@ static void reap_pending_reads(ServerContext *ctx, i64 now, PendingResponseArr *
     }
 }
 
-// Returns the poll timeout for the earliest pending read, or -1 when none is pending.
-static int pending_read_timeout_ms(const ServerContext *ctx, i64 now) {
+// Writes the poll timeout for the earliest pending read. Returns false when no read is pending.
+static bool pending_read_timeout_ms(const ServerContext *ctx, i64 now, int *out) {
     bool found = false;
     i64 earliest = 0;
     for (usize i = 0; i < MAX_PENDING; ++i) {
@@ -318,34 +327,37 @@ static int pending_read_timeout_ms(const ServerContext *ctx, i64 now) {
         }
     }
     if (!found) {
-        return -1;
+        return false;
     }
     i64 remaining = earliest - now;
     if (remaining <= 0) {
-        return 0;
+        *out = 0;
+    } else if (remaining > INT_MAX) {
+        *out = INT_MAX;
+    } else {
+        *out = (int)remaining;
     }
-    if (remaining > INT_MAX) {
-        return INT_MAX;
-    }
-    return (int)remaining;
+    return true;
 }
 
-static PendingKVAdd *alloc_pending_read(ServerContext *ctx) {
+static int alloc_pending_read(ServerContext *ctx, PendingKVAdd **out) {
+    *out = NULL;
     for (usize i = 0; i < MAX_PENDING; ++i) {
         if (!ctx->pending_adds[i].used) {
-            return &ctx->pending_adds[i];
+            *out = &ctx->pending_adds[i];
+            return 0;
         }
     }
-    return NULL;
+    return -ENOSPC;
 }
 
-static bool request_msg_id(const Request *req, u64 *msg_id) {
+static int request_msg_id(const Request *req, u64 *msg_id) {
     if (!req->has_msg_id) {
         fprintf(stderr, "incorrect type for type or msg_id\n");
-        return false;
+        return -EINVAL;
     }
     *msg_id = req->msg_id;
-    return true;
+    return 0;
 }
 
 static PendingResponseArr handle_read_ok(ServerContext *ctx, const Request *req) {
@@ -368,8 +380,8 @@ static PendingResponseArr handle_read_ok(ServerContext *ctx, const Request *req)
     }
     u64 in_reply_to = (u64)reply_ptr->valuedouble;
 
-    PendingKVReadAll *pr = find_pending_kv_read_all(ctx, in_reply_to);
-    if (pr == NULL) {
+    PendingKVReadAll *pr;
+    if (!find_pending_kv_read_all(ctx, in_reply_to, &pr)) {
         goto done;
     }
 
@@ -399,8 +411,8 @@ static PendingResponseArr handle_write_ok(ServerContext *ctx, const Request *req
     }
     u64 in_reply_to = (u64)reply_ptr->valuedouble;
 
-    PendingKVAdd *p = find_pending_add(ctx, in_reply_to);
-    if (p != NULL) {
+    PendingKVAdd *p;
+    if (find_pending_add(ctx, in_reply_to, &p)) {
         body = reply_body(ctx->next_msg_id++, (const u8 *)"add_ok", p->client_msg_id);
         res_add(&res, ctx->node_id, p->client_src, body);
         body = NULL;
@@ -425,8 +437,8 @@ static PendingResponseArr handle_error(ServerContext *ctx, const Request *req) {
     i32 code = cJSON_IsNumber(code_ptr) ? code_ptr->valueint : -1;
 
     if (code == err_code_key_does_not_exist) {
-        PendingKVReadAll *pr = find_pending_kv_read_all(ctx, in_reply_to);
-        if (pr != NULL && --pr->remaining == 0) {
+        PendingKVReadAll *pr;
+        if (find_pending_kv_read_all(ctx, in_reply_to, &pr) && --pr->remaining == 0) {
             body = reply_body(ctx->next_msg_id++, (const u8 *)"read_ok", pr->client_msg_id);
             if (!cJSON_AddNumberToObject(body, "value", (double)pr->sum)) {
                 cJSON_Delete(body);
@@ -446,7 +458,7 @@ static PendingResponseArr handle_init(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
     u64 msg_id;
-    if (!request_msg_id(req, &msg_id)) {
+    if (request_msg_id(req, &msg_id) < 0) {
         goto done;
     }
 
@@ -516,7 +528,7 @@ static PendingResponseArr handle_echo(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
     u64 msg_id;
-    if (!request_msg_id(req, &msg_id)) {
+    if (request_msg_id(req, &msg_id) < 0) {
         goto done;
     }
 
@@ -543,7 +555,7 @@ static PendingResponseArr handle_generate(ServerContext *ctx, const Request *req
     PendingResponseArr res = {0};
     cJSON *body = NULL;
     u64 msg_id;
-    if (!request_msg_id(req, &msg_id)) {
+    if (request_msg_id(req, &msg_id) < 0) {
         goto done;
     }
 
@@ -595,7 +607,7 @@ static PendingResponseArr handle_broadcast(ServerContext *ctx, const Request *re
     PendingResponseArr res = {0};
     cJSON *body = NULL;
     u64 msg_id;
-    if (!request_msg_id(req, &msg_id)) {
+    if (request_msg_id(req, &msg_id) < 0) {
         goto done;
     }
 
@@ -630,12 +642,12 @@ done:
 static PendingResponseArr handle_read(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     u64 msg_id;
-    if (!request_msg_id(req, &msg_id)) {
+    if (request_msg_id(req, &msg_id) < 0) {
         goto done;
     }
 
-    PendingKVReadAll *pr = alloc_pending_kv_read_all(ctx);
-    if (pr == NULL) {
+    PendingKVReadAll *pr;
+    if (alloc_pending_kv_read_all(ctx, &pr) < 0) {
         res_error(&res, ctx->node_id, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
                   err_code_temporarily_unavailable, err_too_many_pending_reads);
         goto done;
@@ -675,7 +687,7 @@ static PendingResponseArr handle_topology(ServerContext *ctx, const Request *req
     PendingResponseArr res = {0};
     cJSON *body = NULL;
     u64 msg_id;
-    if (!request_msg_id(req, &msg_id)) {
+    if (request_msg_id(req, &msg_id) < 0) {
         goto done;
     }
 
@@ -696,7 +708,7 @@ done:
 static PendingResponseArr handle_add(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     u64 msg_id;
-    if (!request_msg_id(req, &msg_id)) {
+    if (request_msg_id(req, &msg_id) < 0) {
         goto done;
     }
 
@@ -713,8 +725,8 @@ static PendingResponseArr handle_add(ServerContext *ctx, const Request *req) {
         goto done;
     }
 
-    PendingKVAdd *pa = alloc_pending_read(ctx);
-    if (pa == NULL) {
+    PendingKVAdd *pa;
+    if (alloc_pending_read(ctx, &pa) < 0) {
         res_error(&res, ctx->node_id, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
                   err_code_temporarily_unavailable, err_too_many_pending_adds);
         goto done;
@@ -747,7 +759,7 @@ static PendingResponseArr handle_send(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
     u64 msg_id;
-    if (!request_msg_id(req, &msg_id)) {
+    if (request_msg_id(req, &msg_id) < 0) {
         goto done;
     }
 
@@ -773,16 +785,16 @@ static PendingResponseArr handle_send(ServerContext *ctx, const Request *req) {
         goto done;
     }
 
-    i64 log_idx = find_log_idx_by_key(ctx->lb, (const u8 *)key_obj->valuestring);
+    usize log_idx;
 
-    if (log_idx == -1) {
+    if (!find_log_idx_by_key(ctx->lb, (const u8 *)key_obj->valuestring, &log_idx)) {
         if (ctx->lb->next_log_idx >= MAX_LOGS) {
             res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
                       err_code_temporarily_unavailable, err_too_many_logs);
             goto done;
         }
 
-        log_idx = (i64)ctx->lb->next_log_idx++;
+        log_idx = ctx->lb->next_log_idx++;
         memcpy(ctx->lb->keys[log_idx], key_obj->valuestring, key_len + 1);
     }
 
@@ -813,7 +825,7 @@ static PendingResponseArr handle_poll(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *poll_res_obj = NULL;
     u64 msg_id;
-    if (!request_msg_id(req, &msg_id)) {
+    if (request_msg_id(req, &msg_id) < 0) {
         goto done;
     }
 
@@ -843,8 +855,8 @@ static PendingResponseArr handle_poll(ServerContext *ctx, const Request *req) {
         }
         const u64 offset = (u64)it->valuedouble;
 
-        i64 log_idx = find_log_idx_by_key(ctx->lb, (const u8 *)key);
-        if (log_idx == -1) {
+        usize log_idx;
+        if (!find_log_idx_by_key(ctx->lb, (const u8 *)key, &log_idx)) {
             it = it->next;
             continue;
         }
@@ -918,7 +930,7 @@ static PendingResponseArr handle_commit_offsets(ServerContext *ctx, const Reques
     PendingResponseArr res = {0};
     cJSON *body = NULL;
     u64 msg_id;
-    if (!request_msg_id(req, &msg_id)) {
+    if (request_msg_id(req, &msg_id) < 0) {
         goto done;
     }
 
@@ -939,8 +951,8 @@ static PendingResponseArr handle_commit_offsets(ServerContext *ctx, const Reques
         }
         const u64 offset_val = (u64)it->valuedouble;
 
-        i64 log_idx = find_log_idx_by_key(ctx->lb, (const u8 *)key);
-        if (log_idx == -1) {
+        usize log_idx;
+        if (!find_log_idx_by_key(ctx->lb, (const u8 *)key, &log_idx)) {
             it = it->next;
             continue;
         }
@@ -965,7 +977,7 @@ static PendingResponseArr handle_list_committed_offsets(ServerContext *ctx, cons
     PendingResponseArr res = {0};
     cJSON *body = NULL;
     u64 msg_id;
-    if (!request_msg_id(req, &msg_id)) {
+    if (request_msg_id(req, &msg_id) < 0) {
         goto done;
     }
 
@@ -994,8 +1006,8 @@ static PendingResponseArr handle_list_committed_offsets(ServerContext *ctx, cons
 
         const u8 *key_str = (const u8 *)it->valuestring;
 
-        i64 log_idx = find_log_idx_by_key(ctx->lb, key_str);
-        if (log_idx == -1) {
+        usize log_idx;
+        if (!find_log_idx_by_key(ctx->lb, key_str, &log_idx)) {
             continue;
         }
 
@@ -1017,7 +1029,7 @@ static PendingResponseArr handle_txn(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
     u64 msg_id;
-    if (!request_msg_id(req, &msg_id)) {
+    if (request_msg_id(req, &msg_id) < 0) {
         goto done;
     }
 
@@ -1035,12 +1047,11 @@ static PendingResponseArr handle_txn(ServerContext *ctx, const Request *req) {
         fatal("could not build txn reply");
     }
 
-    bool error_in_foreach = false;
-    bool kv_full = false;
+    int status = 0;
     const cJSON *it = NULL;
     cJSON_ArrayForEach(it, txn_arr_obj) {
         if (!cJSON_IsArray(it)) {
-            error_in_foreach = true;
+            status = -EINVAL;
             break;
         }
 
@@ -1048,16 +1059,17 @@ static PendingResponseArr handle_txn(ServerContext *ctx, const Request *req) {
               *val = cJSON_GetArrayItem(it, 2);
 
         if (!op || !cJSON_IsString(op) || op->valuestring == NULL || !key || !cJSON_IsNumber(key)) {
-            error_in_foreach = true;
+            status = -EINVAL;
             break;
         }
 
         if (!strcmp(op->valuestring, "w") && (!val || !cJSON_IsNumber(val))) {
-            error_in_foreach = true;
+            status = -EINVAL;
             break;
         }
 
-        i64 idx = find_kv_entry_idx_by_key(ctx->kvs, (i64)key->valuedouble);
+        usize idx;
+        bool found = find_kv_entry_idx_by_key(ctx->kvs, (i64)key->valuedouble, &idx);
 
         cJSON *op_res_arr = cJSON_CreateArray();
         if (!op_res_arr) {
@@ -1097,7 +1109,7 @@ static PendingResponseArr handle_txn(ServerContext *ctx, const Request *req) {
 
         if (!strcmp(op->valuestring, "r")) {
             cJSON *val_res_obj;
-            if (idx == -1) {
+            if (!found) {
                 val_res_obj = cJSON_CreateNull();
             } else {
                 i64 read_val = ctx->kvs->vals[idx];
@@ -1115,12 +1127,12 @@ static PendingResponseArr handle_txn(ServerContext *ctx, const Request *req) {
                 fatal("could not build txn reply");
             }
         } else if (!strcmp(op->valuestring, "w")) {
-            if (idx == -1) {
+            if (!found) {
                 if (ctx->kvs->empty_idx >= MAX_KV_ENTRIES) {
-                    kv_full = true;
+                    status = -ENOSPC;
                     break;
                 }
-                idx = (i64)ctx->kvs->empty_idx++;
+                idx = ctx->kvs->empty_idx++;
                 ctx->kvs->keys[idx] = (i64)key->valuedouble;
             }
             ctx->kvs->vals[idx] = (i64)val->valuedouble;
@@ -1137,18 +1149,18 @@ static PendingResponseArr handle_txn(ServerContext *ctx, const Request *req) {
                 fatal("could not build txn reply");
             }
         } else {
-            error_in_foreach = true;
+            status = -EINVAL;
             break;
         }
     }
 
-    if (kv_full) {
+    if (status == -ENOSPC) {
         res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
                   err_code_temporarily_unavailable, err_kv_full);
         goto done;
     }
 
-    if (error_in_foreach) {
+    if (status < 0) {
         res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
                   err_code_malformed_request, err_malformed_txn);
         goto done;
@@ -1179,13 +1191,14 @@ static const RequestHandlerEntry handlers[] = {
     {"txn", handle_txn},
 };
 
-static const RequestHandlerEntry *find_handler(const char *name) {
+static bool find_handler(const char *name, const RequestHandlerEntry **out) {
     for (usize i = 0; i < ARRAY_SIZE(handlers); ++i) {
         if (strcmp(name, handlers[i].name) == 0) {
-            return &handlers[i];
+            *out = &handlers[i];
+            return true;
         }
     }
-    return NULL;
+    return false;
 }
 
 static PendingResponseArr handle_request(ServerContext *ctx, const Request *req) {
@@ -1200,10 +1213,10 @@ static PendingResponseArr handle_request(ServerContext *ctx, const Request *req)
         return res;
     }
 
-    const RequestHandlerEntry *entry = find_handler(type->valuestring);
-    if (entry == NULL) {
+    const RequestHandlerEntry *entry;
+    if (!find_handler(type->valuestring, &entry)) {
         u64 msg_id;
-        if (request_msg_id(req, &msg_id)) {
+        if (request_msg_id(req, &msg_id) == 0) {
             res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
                       err_code_not_supported, err_not_supported);
         }
@@ -1259,8 +1272,8 @@ int main(void) {
         fatal("could not ignore SIGPIPE");
     }
 
-    ServerContext *ctx = server_context_new();
-    if (ctx == NULL) {
+    ServerContext *ctx;
+    if (server_context_new(&ctx) < 0) {
         fatal("could not allocate server context");
     }
 
@@ -1276,7 +1289,11 @@ int main(void) {
         send_response(&timeout_res);
 
         struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
-        int ready = poll(&pfd, 1, pending_read_timeout_ms(ctx, loop_now));
+        int poll_timeout_ms;
+        if (!pending_read_timeout_ms(ctx, loop_now, &poll_timeout_ms)) {
+            poll_timeout_ms = -1;
+        }
+        int ready = poll(&pfd, 1, poll_timeout_ms);
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
