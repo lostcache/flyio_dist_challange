@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "types.h"
@@ -143,9 +143,9 @@ static _Noreturn void fatal(const char *message) {
 }
 
 static i64 now_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (i64)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (i64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 static cJSON *reply_body(u64 msg_id, const u8 *type, u64 in_reply_to) {
