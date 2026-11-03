@@ -124,7 +124,7 @@ typedef struct {
     i64 logs[MAX_LOGS][LOG_RING_BUF_SIZE];
     usize next_log_idx;
     u64 next_log_offsets[MAX_LOGS];
-    u64 uncomitted_offset_start[MAX_LOGS];
+    u64 uncommitted_offset_start[MAX_LOGS];
 } LogBuffers;
 
 typedef struct {
@@ -169,14 +169,14 @@ static i64 now_ms(void) {
 
 // Returns a new reply body built from borrowed type. The caller owns the object and must free it
 // with cJSON_Delete().
-static cJSON *reply_body(u64 msg_id, const char *type, u64 in_reply_to) {
+static cJSON *reply_body(u64 msg_id, const char *type, u64 client_msg_id) {
     cJSON *body = cJSON_CreateObject();
     if (!body) {
         fatal("could not create reply body");
     }
     if (!cJSON_AddStringToObject(body, "type", type) ||
         !cJSON_AddNumberToObject(body, "msg_id", (double)msg_id) ||
-        !cJSON_AddNumberToObject(body, "in_reply_to", (double)in_reply_to)) {
+        !cJSON_AddNumberToObject(body, "in_reply_to", (double)client_msg_id)) {
         cJSON_Delete(body);
         fatal("could not build reply body");
     }
@@ -204,8 +204,8 @@ static void res_add(PendingResponseArr *res, const char *src, const char *dest, 
 
 // Builds an error body and appends it to res. src, dest, and text are borrowed. res owns the body.
 static void res_error(PendingResponseArr *res, const char *src, const char *dest, u64 msg_id,
-                      u64 in_reply_to, ErrorCode code, const char *text) {
-    cJSON *body = reply_body(msg_id, "error", in_reply_to);
+                      u64 client_msg_id, ErrorCode code, const char *text) {
+    cJSON *body = reply_body(msg_id, "error", client_msg_id);
     if (!cJSON_AddNumberToObject(body, "code", code) ||
         !cJSON_AddStringToObject(body, "text", text)) {
         cJSON_Delete(body);
@@ -374,7 +374,7 @@ static bool pending_read_timeout_ms(const ServerContext *ctx, i64 now, int *out)
 
 // Reserves a pending add slot. Returns 0, or -ENOSPC when full; *out is a borrowed slot (NULL on
 // failure).
-static int alloc_pending_read(ServerContext *ctx, PendingKVAdd **out) {
+static int alloc_pending_add(ServerContext *ctx, PendingKVAdd **out) {
     *out = NULL;
     for (usize i = 0; i < ARRAY_SIZE(ctx->pending_adds); ++i) {
         if (!ctx->pending_adds[i].used) {
@@ -414,10 +414,10 @@ static PendingResponseArr handle_read_ok(ServerContext *ctx, const Request *req)
     if (!cJSON_IsNumber(reply_ptr)) {
         goto done;
     }
-    u64 in_reply_to = (u64)reply_ptr->valuedouble;
+    u64 client_msg_id = (u64)reply_ptr->valuedouble;
 
     PendingKVReadAll *pr;
-    if (!find_pending_kv_read_all(ctx, in_reply_to, &pr)) {
+    if (!find_pending_kv_read_all(ctx, client_msg_id, &pr)) {
         goto done;
     }
 
@@ -447,10 +447,10 @@ static PendingResponseArr handle_write_ok(ServerContext *ctx, const Request *req
     if (!cJSON_IsNumber(reply_ptr)) {
         goto done;
     }
-    u64 in_reply_to = (u64)reply_ptr->valuedouble;
+    u64 client_msg_id = (u64)reply_ptr->valuedouble;
 
     PendingKVAdd *p;
-    if (find_pending_add(ctx, in_reply_to, &p)) {
+    if (find_pending_add(ctx, client_msg_id, &p)) {
         body = reply_body(ctx->next_msg_id++, "add_ok", p->client_msg_id);
         res_add(&res, ctx->node_id, p->client_src, body);
         body = NULL;
@@ -470,14 +470,14 @@ static PendingResponseArr handle_error(ServerContext *ctx, const Request *req) {
     if (!cJSON_IsNumber(reply_ptr)) {
         goto done;
     }
-    u64 in_reply_to = (u64)reply_ptr->valuedouble;
+    u64 client_msg_id = (u64)reply_ptr->valuedouble;
 
     const cJSON *code_ptr = cJSON_GetObjectItem(req->body, "code");
     i32 code = cJSON_IsNumber(code_ptr) ? code_ptr->valueint : -1;
 
     if (code == err_code_key_does_not_exist) {
         PendingKVReadAll *pr;
-        if (find_pending_kv_read_all(ctx, in_reply_to, &pr) && --pr->remaining == 0) {
+        if (find_pending_kv_read_all(ctx, client_msg_id, &pr) && --pr->remaining == 0) {
             body = reply_body(ctx->next_msg_id++, "read_ok", pr->client_msg_id);
             if (!cJSON_AddNumberToObject(body, "value", (double)pr->sum)) {
                 cJSON_Delete(body);
@@ -775,7 +775,7 @@ static PendingResponseArr handle_add(ServerContext *ctx, const Request *req) {
     }
 
     PendingKVAdd *pa;
-    if (alloc_pending_read(ctx, &pa) < 0) {
+    if (alloc_pending_add(ctx, &pa) < 0) {
         res_error(&res, ctx->node_id, req->src, ctx->next_msg_id++, msg_id,
                   err_code_temporarily_unavailable, err_too_many_pending_adds);
         goto done;
@@ -1011,8 +1011,8 @@ static PendingResponseArr handle_commit_offsets(ServerContext *ctx, const Reques
         }
 
         u64 next_uncommitted = offset_val + 1;
-        if (next_uncommitted > ctx->lb->uncomitted_offset_start[log_idx]) {
-            ctx->lb->uncomitted_offset_start[log_idx] = next_uncommitted;
+        if (next_uncommitted > ctx->lb->uncommitted_offset_start[log_idx]) {
+            ctx->lb->uncommitted_offset_start[log_idx] = next_uncommitted;
         }
 
         it = it->next;
@@ -1067,7 +1067,7 @@ static PendingResponseArr handle_list_committed_offsets(ServerContext *ctx, cons
         }
 
         if (!cJSON_AddNumberToObject(res_offsets_obj, key_str,
-                                     (double)ctx->lb->uncomitted_offset_start[log_idx] - 1)) {
+                                     (double)ctx->lb->uncommitted_offset_start[log_idx] - 1)) {
             cJSON_Delete(body);
             fatal("could not build offsets reply");
         }
