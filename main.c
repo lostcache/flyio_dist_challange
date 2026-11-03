@@ -16,6 +16,7 @@
 #define MAX_NODES 128
 #define MAX_NODE_NAME_LEN 16
 #define MAX_PENDING 256
+#define MAX_BROADCAST_MESSAGES 4096
 
 #define MAX_OUTGOING (MAX_PENDING + 1)
 
@@ -33,6 +34,10 @@ _Static_assert((LOG_RING_BUF_SIZE & (LOG_RING_BUF_SIZE - 1)) == 0,
 #define KV_BUF_SIZE 1024
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+
+_Static_assert(MAX_NODES <= 256, "MAX_NODES must not exceed 256");
+_Static_assert(MAX_OUTGOING > MAX_PENDING, "MAX_OUTGOING must exceed MAX_PENDING");
+_Static_assert(MAX_BROADCAST_MESSAGES > 0, "broadcast message buffer must not be empty");
 
 typedef enum {
     err_code_timeout = 0,
@@ -88,7 +93,7 @@ typedef struct {
 } PendingResponseArr;
 
 typedef struct {
-    i32 msg_vals[4096];
+    i32 msg_vals[MAX_BROADCAST_MESSAGES];
     usize size;
     usize cap;
 } BroadcastMessages;
@@ -178,7 +183,7 @@ static void res_add(PendingResponseArr *res, const char *src, const char *dest, 
         cJSON_Delete(body);
         fatal("outgoing node name too long");
     }
-    if (res->count >= MAX_OUTGOING) {
+    if (res->count >= ARRAY_SIZE(res->items)) {
         cJSON_Delete(body);
         fatal("too many outgoing messages");
     }
@@ -228,7 +233,9 @@ static int server_context_new(ServerContext **out) {
         return -ENOMEM;
     }
 
-    ctx->bd_msg.cap = 4096;
+    ctx->bd_msg = (BroadcastMessages){
+        .cap = MAX_BROADCAST_MESSAGES,
+    };
     ctx->next_msg_id = 1;
     *out = ctx;
     return 0;
@@ -244,7 +251,7 @@ static void server_context_free(ServerContext *ctx) {
 }
 
 static bool find_pending_add(ServerContext *ctx, u64 kv_msg_id, PendingKVAdd **out) {
-    for (usize i = 0; i < MAX_PENDING; ++i) {
+    for (usize i = 0; i < ARRAY_SIZE(ctx->pending_adds); ++i) {
         if (ctx->pending_adds[i].used && ctx->pending_adds[i].kv_msg_id == kv_msg_id) {
             *out = &ctx->pending_adds[i];
             return true;
@@ -255,7 +262,7 @@ static bool find_pending_add(ServerContext *ctx, u64 kv_msg_id, PendingKVAdd **o
 
 static int alloc_pending_kv_read_all(ServerContext *ctx, PendingKVReadAll **out) {
     *out = NULL;
-    for (usize i = 0; i < MAX_PENDING; ++i) {
+    for (usize i = 0; i < ARRAY_SIZE(ctx->pending_read_alls); ++i) {
         if (!ctx->pending_read_alls[i].used) {
             *out = &ctx->pending_read_alls[i];
             return 0;
@@ -265,7 +272,7 @@ static int alloc_pending_kv_read_all(ServerContext *ctx, PendingKVReadAll **out)
 }
 
 static bool find_pending_kv_read_all(ServerContext *ctx, u64 kv_msg_id, PendingKVReadAll **out) {
-    for (usize i = 0; i < MAX_PENDING; ++i) {
+    for (usize i = 0; i < ARRAY_SIZE(ctx->pending_read_alls); ++i) {
         if (!ctx->pending_read_alls[i].used) {
             continue;
         }
@@ -301,7 +308,7 @@ static bool find_kv_entry_idx_by_key(KVStore *kvs, i64 key, usize *out) {
 
 // Answers expired pending reads with a timeout error and releases their slots.
 static void reap_pending_reads(ServerContext *ctx, i64 now, PendingResponseArr *out) {
-    for (usize i = 0; i < MAX_PENDING; ++i) {
+    for (usize i = 0; i < ARRAY_SIZE(ctx->pending_read_alls); ++i) {
         PendingKVReadAll *pr = &ctx->pending_read_alls[i];
         if (!pr->used || now < pr->deadline_ms) {
             continue;
@@ -316,7 +323,7 @@ static void reap_pending_reads(ServerContext *ctx, i64 now, PendingResponseArr *
 static bool pending_read_timeout_ms(const ServerContext *ctx, i64 now, int *out) {
     bool found = false;
     i64 earliest = 0;
-    for (usize i = 0; i < MAX_PENDING; ++i) {
+    for (usize i = 0; i < ARRAY_SIZE(ctx->pending_read_alls); ++i) {
         const PendingKVReadAll *pr = &ctx->pending_read_alls[i];
         if (!pr->used) {
             continue;
@@ -342,7 +349,7 @@ static bool pending_read_timeout_ms(const ServerContext *ctx, i64 now, int *out)
 
 static int alloc_pending_read(ServerContext *ctx, PendingKVAdd **out) {
     *out = NULL;
-    for (usize i = 0; i < MAX_PENDING; ++i) {
+    for (usize i = 0; i < ARRAY_SIZE(ctx->pending_adds); ++i) {
         if (!ctx->pending_adds[i].used) {
             *out = &ctx->pending_adds[i];
             return 0;
@@ -508,7 +515,7 @@ static PendingResponseArr handle_init(ServerContext *ctx, const Request *req) {
         if (!cJSON_IsString(it) || it->valuestring == NULL) {
             continue;
         }
-        if (ctx->next_node_idx >= MAX_NODES) {
+        if (ctx->next_node_idx >= ARRAY_SIZE(ctx->node_ids)) {
             break;
         }
         usize name_len = strlen(it->valuestring);
@@ -788,7 +795,7 @@ static PendingResponseArr handle_send(ServerContext *ctx, const Request *req) {
     usize log_idx;
 
     if (!find_log_idx_by_key(ctx->lb, key_obj->valuestring, &log_idx)) {
-        if (ctx->lb->next_log_idx >= MAX_LOGS) {
+        if (ctx->lb->next_log_idx >= ARRAY_SIZE(ctx->lb->keys)) {
             res_error(&res, req->dest, req->src, ctx->next_msg_id++, msg_id,
                       err_code_temporarily_unavailable, err_too_many_logs);
             goto done;
@@ -1128,7 +1135,7 @@ static PendingResponseArr handle_txn(ServerContext *ctx, const Request *req) {
             }
         } else if (!strcmp(op->valuestring, "w")) {
             if (!found) {
-                if (ctx->kvs->empty_idx >= MAX_KV_ENTRIES) {
+                if (ctx->kvs->empty_idx >= ARRAY_SIZE(ctx->kvs->keys)) {
                     status = -ENOSPC;
                     break;
                 }
@@ -1174,21 +1181,21 @@ done:
 }
 
 static const RequestHandlerEntry handlers[] = {
-    {"read_ok", handle_read_ok},
-    {"write_ok", handle_write_ok},
-    {"error", handle_error},
-    {"init", handle_init},
-    {"echo", handle_echo},
-    {"generate", handle_generate},
-    {"broadcast", handle_broadcast},
-    {"read", handle_read},
-    {"topology", handle_topology},
-    {"add", handle_add},
-    {"send", handle_send},
-    {"poll", handle_poll},
-    {"commit_offsets", handle_commit_offsets},
-    {"list_committed_offsets", handle_list_committed_offsets},
-    {"txn", handle_txn},
+    {.name = "read_ok", .handler = handle_read_ok},
+    {.name = "write_ok", .handler = handle_write_ok},
+    {.name = "error", .handler = handle_error},
+    {.name = "init", .handler = handle_init},
+    {.name = "echo", .handler = handle_echo},
+    {.name = "generate", .handler = handle_generate},
+    {.name = "broadcast", .handler = handle_broadcast},
+    {.name = "read", .handler = handle_read},
+    {.name = "topology", .handler = handle_topology},
+    {.name = "add", .handler = handle_add},
+    {.name = "send", .handler = handle_send},
+    {.name = "poll", .handler = handle_poll},
+    {.name = "commit_offsets", .handler = handle_commit_offsets},
+    {.name = "list_committed_offsets", .handler = handle_list_committed_offsets},
+    {.name = "txn", .handler = handle_txn},
 };
 
 static bool find_handler(const char *name, const RequestHandlerEntry **out) {
