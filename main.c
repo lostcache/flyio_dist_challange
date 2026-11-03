@@ -35,6 +35,9 @@ _Static_assert((LOG_RING_BUF_SIZE & (LOG_RING_BUF_SIZE - 1)) == 0,
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
+#define log_warn(...) fprintf(stderr, "warning: " __VA_ARGS__)
+#define log_error(...) fprintf(stderr, "error: " __VA_ARGS__)
+
 _Static_assert(MAX_NODES <= 256, "MAX_NODES must not exceed 256");
 _Static_assert(MAX_OUTGOING > MAX_PENDING, "MAX_OUTGOING must exceed MAX_PENDING");
 _Static_assert(MAX_BROADCAST_MESSAGES > 0, "broadcast message buffer must not be empty");
@@ -152,7 +155,7 @@ typedef struct {
 } RequestHandlerEntry;
 
 static _Noreturn void fatal(const char *message) {
-    fprintf(stderr, "fatal: %s\n", message);
+    log_error("fatal: %s\n", message);
     exit(EXIT_FAILURE);
 }
 
@@ -360,7 +363,7 @@ static int alloc_pending_read(ServerContext *ctx, PendingKVAdd **out) {
 
 static int request_msg_id(const Request *req, u64 *msg_id) {
     if (!req->has_msg_id) {
-        fprintf(stderr, "incorrect type for type or msg_id\n");
+        log_warn("incorrect type for type or msg_id\n");
         return -EINVAL;
     }
     *msg_id = req->msg_id;
@@ -1316,7 +1319,7 @@ int main(void) {
         cJSON *msg_json = cJSON_Parse(msg);
 
         if (!msg_json) {
-            fprintf(stderr, "couldn't parse msg: %s\n", msg);
+            log_warn("couldn't parse msg: %s\n", msg);
             continue;
         }
 
@@ -1325,13 +1328,13 @@ int main(void) {
         const cJSON *src, *dest, *body, *type;
 
         if (!cJSON_IsObject(msg_json)) {
-            fprintf(stderr, "message is not a JSON object\n");
+            log_warn("message is not a JSON object\n");
             goto next;
         }
 
         if (!cJSON_HasObjectItem(msg_json, "src") || !cJSON_HasObjectItem(msg_json, "dest") ||
             !cJSON_HasObjectItem(msg_json, "body")) {
-            fprintf(stderr, "field/s src, dest or body not found\n");
+            log_warn("field/s src, dest or body not found\n");
             goto next;
         }
 
@@ -1340,19 +1343,19 @@ int main(void) {
         body = cJSON_GetObjectItem(msg_json, "body");
         if (!cJSON_IsString(src) || src->valuestring == NULL || !cJSON_IsString(dest) ||
             dest->valuestring == NULL || !cJSON_IsObject(body)) {
-            fprintf(stderr, "incorrect type for src, dest or body\n");
+            log_warn("incorrect type for src, dest or body\n");
             goto next;
         }
 
         if (strlen(src->valuestring) >= MAX_NODE_NAME_LEN ||
             strlen(dest->valuestring) >= MAX_NODE_NAME_LEN) {
-            fprintf(stderr, "src or dest too long\n");
+            log_warn("src or dest too long\n");
             goto next;
         }
 
         type = cJSON_GetObjectItem(body, "type");
         if (!cJSON_IsString(type) || type->valuestring == NULL) {
-            fprintf(stderr, "field/s type not found or not a string\n");
+            log_warn("field/s type not found or not a string\n");
             goto next;
         }
 
@@ -1375,7 +1378,7 @@ int main(void) {
     }
 
     if (ferror(stdin)) {
-        fprintf(stderr, "could not read stdin\n");
+        log_error("could not read stdin\n");
         server_context_free(ctx);
         return EXIT_FAILURE;
     }
