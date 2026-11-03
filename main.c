@@ -154,17 +154,21 @@ typedef struct {
     RequestHandler handler;
 } RequestHandlerEntry;
 
+// Takes a borrowed message. Does not return; exits the process.
 static _Noreturn void fatal(const char *message) {
     log_error("fatal: %s\n", message);
     exit(EXIT_FAILURE);
 }
 
+// Returns monotonic time in milliseconds.
 static i64 now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (i64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+// Returns a new reply body built from borrowed type. The caller owns the object and must free it
+// with cJSON_Delete().
 static cJSON *reply_body(u64 msg_id, const char *type, u64 in_reply_to) {
     cJSON *body = cJSON_CreateObject();
     if (!body) {
@@ -179,6 +183,7 @@ static cJSON *reply_body(u64 msg_id, const char *type, u64 in_reply_to) {
     return body;
 }
 
+// Takes ownership of body and appends it to res. src and dest are borrowed.
 static void res_add(PendingResponseArr *res, const char *src, const char *dest, cJSON *body) {
     usize src_len = strlen(src);
     usize dest_len = strlen(dest);
@@ -197,6 +202,7 @@ static void res_add(PendingResponseArr *res, const char *src, const char *dest, 
     out->body = body;
 }
 
+// Builds an error body and appends it to res. src, dest, and text are borrowed. res owns the body.
 static void res_error(PendingResponseArr *res, const char *src, const char *dest, u64 msg_id,
                       u64 in_reply_to, ErrorCode code, const char *text) {
     cJSON *body = reply_body(msg_id, "error", in_reply_to);
@@ -208,6 +214,7 @@ static void res_error(PendingResponseArr *res, const char *src, const char *dest
     res_add(res, src, dest, body);
 }
 
+// Frees all bodies in res and resets its count. Does not free res.
 static void response_free(PendingResponseArr *res) {
     for (usize i = 0; i < res->count; ++i) {
         cJSON_Delete(res->items[i].body);
@@ -215,6 +222,8 @@ static void response_free(PendingResponseArr *res) {
     res->count = 0;
 }
 
+// Allocates a context and writes it to out. Returns 0, or -ENOMEM on failure. The caller must call
+// server_context_free().
 static int server_context_new(ServerContext **out) {
     *out = NULL;
 
@@ -244,6 +253,7 @@ static int server_context_new(ServerContext **out) {
     return 0;
 }
 
+// Frees ctx and its members. Accepts NULL and does not free the pointer itself.
 static void server_context_free(ServerContext *ctx) {
     if (ctx == NULL) {
         return;
@@ -253,6 +263,8 @@ static void server_context_free(ServerContext *ctx) {
     free(ctx);
 }
 
+// Looks up a pending add by KV message ID. On success writes a borrowed slot to out and returns
+// true.
 static bool find_pending_add(ServerContext *ctx, u64 kv_msg_id, PendingKVAdd **out) {
     for (usize i = 0; i < ARRAY_SIZE(ctx->pending_adds); ++i) {
         if (ctx->pending_adds[i].used && ctx->pending_adds[i].kv_msg_id == kv_msg_id) {
@@ -263,6 +275,8 @@ static bool find_pending_add(ServerContext *ctx, u64 kv_msg_id, PendingKVAdd **o
     return false;
 }
 
+// Reserves a pending read slot. Returns 0, or -ENOSPC when full; *out is a borrowed slot (NULL on
+// failure).
 static int alloc_pending_kv_read_all(ServerContext *ctx, PendingKVReadAll **out) {
     *out = NULL;
     for (usize i = 0; i < ARRAY_SIZE(ctx->pending_read_alls); ++i) {
@@ -274,6 +288,8 @@ static int alloc_pending_kv_read_all(ServerContext *ctx, PendingKVReadAll **out)
     return -ENOSPC;
 }
 
+// Looks up a pending read by KV message ID. On success writes a borrowed slot to out and returns
+// true.
 static bool find_pending_kv_read_all(ServerContext *ctx, u64 kv_msg_id, PendingKVReadAll **out) {
     for (usize i = 0; i < ARRAY_SIZE(ctx->pending_read_alls); ++i) {
         if (!ctx->pending_read_alls[i].used) {
@@ -289,6 +305,8 @@ static bool find_pending_kv_read_all(ServerContext *ctx, u64 kv_msg_id, PendingK
     return false;
 }
 
+// Looks up a log index by key. On success writes the index to out and returns true. lb and key are
+// borrowed.
 static bool find_log_idx_by_key(LogBuffers *lb, const char *key, usize *out) {
     for (usize i = 0; i < lb->next_log_idx; ++i) {
         if (!strncmp(key, lb->keys[i], MAX_LOG_KEY_LEN)) {
@@ -299,6 +317,8 @@ static bool find_log_idx_by_key(LogBuffers *lb, const char *key, usize *out) {
     return false;
 }
 
+// Looks up a KV entry index by key. On success writes the index to out and returns true. kvs is
+// borrowed.
 static bool find_kv_entry_idx_by_key(KVStore *kvs, i64 key, usize *out) {
     for (usize i = 0; i < kvs->empty_idx; ++i) {
         if (kvs->keys[i] == key) {
@@ -309,7 +329,8 @@ static bool find_kv_entry_idx_by_key(KVStore *kvs, i64 key, usize *out) {
     return false;
 }
 
-// Answers expired pending reads with a timeout error and releases their slots.
+// Appends timeout errors for expired reads to out. ctx and out are borrowed; out owns the bodies.
+// Appends timeout errors for expired reads to out. ctx and out are borrowed; out owns the bodies.
 static void reap_pending_reads(ServerContext *ctx, i64 now, PendingResponseArr *out) {
     for (usize i = 0; i < ARRAY_SIZE(ctx->pending_read_alls); ++i) {
         PendingKVReadAll *pr = &ctx->pending_read_alls[i];
@@ -322,7 +343,8 @@ static void reap_pending_reads(ServerContext *ctx, i64 now, PendingResponseArr *
     }
 }
 
-// Writes the poll timeout for the earliest pending read. Returns false when no read is pending.
+// Writes the poll timeout for the earliest pending read to out. Returns false when none is pending.
+// Writes the poll timeout for the earliest pending read to out. Returns false when none is pending.
 static bool pending_read_timeout_ms(const ServerContext *ctx, i64 now, int *out) {
     bool found = false;
     i64 earliest = 0;
@@ -350,6 +372,8 @@ static bool pending_read_timeout_ms(const ServerContext *ctx, i64 now, int *out)
     return true;
 }
 
+// Reserves a pending add slot. Returns 0, or -ENOSPC when full; *out is a borrowed slot (NULL on
+// failure).
 static int alloc_pending_read(ServerContext *ctx, PendingKVAdd **out) {
     *out = NULL;
     for (usize i = 0; i < ARRAY_SIZE(ctx->pending_adds); ++i) {
@@ -361,6 +385,7 @@ static int alloc_pending_read(ServerContext *ctx, PendingKVAdd **out) {
     return -ENOSPC;
 }
 
+// Reads the request message ID into msg_id. Returns 0, or -EINVAL when the ID is missing.
 static int request_msg_id(const Request *req, u64 *msg_id) {
     if (!req->has_msg_id) {
         log_warn("incorrect type for type or msg_id\n");
@@ -370,6 +395,7 @@ static int request_msg_id(const Request *req, u64 *msg_id) {
     return 0;
 }
 
+// Handles "read_ok". Borrows ctx and req; the caller frees returned responses with response_free().
 static PendingResponseArr handle_read_ok(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
@@ -411,6 +437,8 @@ done:
     return res;
 }
 
+// Handles "write_ok". Borrows ctx and req; the caller frees returned responses with
+// response_free().
 static PendingResponseArr handle_write_ok(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
@@ -433,6 +461,7 @@ done:
     return res;
 }
 
+// Handles "error". Borrows ctx and req; the caller frees returned responses with response_free().
 static PendingResponseArr handle_error(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
@@ -464,6 +493,7 @@ done:
     return res;
 }
 
+// Handles "init". Borrows ctx and req; the caller frees returned responses with response_free().
 static PendingResponseArr handle_init(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
@@ -534,6 +564,7 @@ done:
     return res;
 }
 
+// Handles "echo". Borrows ctx and req; the caller frees returned responses with response_free().
 static PendingResponseArr handle_echo(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
@@ -561,6 +592,8 @@ done:
     return res;
 }
 
+// Handles "generate". Borrows ctx and req; the caller frees returned responses with
+// response_free().
 static PendingResponseArr handle_generate(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
@@ -613,6 +646,8 @@ done:
     return res;
 }
 
+// Handles "broadcast". Borrows ctx and req; the caller frees returned responses with
+// response_free().
 static PendingResponseArr handle_broadcast(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
@@ -649,6 +684,7 @@ done:
     return res;
 }
 
+// Handles "read". Borrows ctx and req; the caller frees returned responses with response_free().
 static PendingResponseArr handle_read(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     u64 msg_id;
@@ -693,6 +729,8 @@ done:
     return res;
 }
 
+// Handles "topology". Borrows ctx and req; the caller frees returned responses with
+// response_free().
 static PendingResponseArr handle_topology(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
@@ -715,6 +753,7 @@ done:
     return res;
 }
 
+// Handles "add". Borrows ctx and req; the caller frees returned responses with response_free().
 static PendingResponseArr handle_add(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     u64 msg_id;
@@ -765,6 +804,7 @@ done:
     return res;
 }
 
+// Handles "send". Borrows ctx and req; the caller frees returned responses with response_free().
 static PendingResponseArr handle_send(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
@@ -831,6 +871,7 @@ done:
     return res;
 }
 
+// Handles "poll". Borrows ctx and req; the caller frees returned responses with response_free().
 static PendingResponseArr handle_poll(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *poll_res_obj = NULL;
@@ -936,6 +977,8 @@ done:
     return res;
 }
 
+// Handles "commit_offsets". Borrows ctx and req; the caller frees returned responses with
+// response_free().
 static PendingResponseArr handle_commit_offsets(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
@@ -983,6 +1026,8 @@ done:
     return res;
 }
 
+// Handles "list_committed_offsets". Borrows ctx and req; the caller frees returned responses with
+// response_free().
 static PendingResponseArr handle_list_committed_offsets(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
@@ -1035,6 +1080,7 @@ done:
     return res;
 }
 
+// Handles "txn". Borrows ctx and req; the caller frees returned responses with response_free().
 static PendingResponseArr handle_txn(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
     cJSON *body = NULL;
@@ -1201,6 +1247,7 @@ static const RequestHandlerEntry handlers[] = {
     {.name = "txn", .handler = handle_txn},
 };
 
+// Looks up a handler by name. On success writes a borrowed static entry to out and returns true.
 static bool find_handler(const char *name, const RequestHandlerEntry **out) {
     for (usize i = 0; i < ARRAY_SIZE(handlers); ++i) {
         if (strcmp(name, handlers[i].name) == 0) {
@@ -1211,6 +1258,8 @@ static bool find_handler(const char *name, const RequestHandlerEntry **out) {
     return false;
 }
 
+// Dispatches a request. Borrows ctx and req; the caller frees returned responses with
+// response_free().
 static PendingResponseArr handle_request(ServerContext *ctx, const Request *req) {
     PendingResponseArr res = {0};
 
@@ -1236,6 +1285,7 @@ static PendingResponseArr handle_request(ServerContext *ctx, const Request *req)
     return entry->handler(ctx, req);
 }
 
+// Takes ownership of body and writes one response envelope to stdout. send frees body.
 static void send(const char *src, const char *dest, cJSON *body) {
     cJSON *res = cJSON_CreateObject();
     if (!res) {
@@ -1264,6 +1314,7 @@ static void send(const char *src, const char *dest, cJSON *body) {
     cJSON_Delete(res);
 }
 
+// Sends and frees all bodies in res, then resets its count. Does not free res.
 static void send_response(PendingResponseArr *res) {
     for (usize i = 0; i < res->count; ++i) {
         cJSON *body = res->items[i].body;
@@ -1273,6 +1324,7 @@ static void send_response(PendingResponseArr *res) {
     response_free(res);
 }
 
+// Runs the server. Returns EXIT_SUCCESS or EXIT_FAILURE.
 int main(void) {
     const usize json_parse_buf_len = 65536;
     char msg[json_parse_buf_len];
