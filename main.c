@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -119,8 +120,6 @@ typedef struct {
     bool node_id_set;
     u8 node_ids[MAX_NODES][MAX_NODE_NAME_LEN];
     usize next_node_idx;
-    i64 prev_generate_time_ms;
-    i32 generate_ms_counter;
     u64 next_msg_id;
     BroadcastMessages bd_msg;
     i64 counter;
@@ -219,7 +218,6 @@ static ServerContext *server_context_new(void) {
 
     ctx->bd_msg.cap = 4096;
     ctx->next_msg_id = 1;
-    ctx->prev_generate_time_ms = now_ms();
     return ctx;
 }
 
@@ -545,24 +543,27 @@ static PendingResponseArr handle_generate(ServerContext *ctx, const Request *req
         goto done;
     }
 
-    i64 now = now_ms();
-    if (now == ctx->prev_generate_time_ms) {
-        if ((ctx->generate_ms_counter + 1) >= (1 << 12)) {
-            do {
-                now = now_ms();
-            } while (ctx->prev_generate_time_ms == now);
-            ctx->prev_generate_time_ms = now;
-            ctx->generate_ms_counter = 0;
-        } else {
-            ctx->generate_ms_counter++;
+    u8 rand_bytes[16];
+    usize rand_filled = 0;
+    while (rand_filled < sizeof rand_bytes) {
+        ssize_t n = getrandom(rand_bytes + rand_filled, sizeof rand_bytes - rand_filled, 0);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 13,
+                      ERR_GENERATE_ID);
+            goto done;
         }
-    } else {
-        ctx->prev_generate_time_ms = now;
-        ctx->generate_ms_counter = 0;
+        rand_filled += (usize)n;
     }
+    u64 id_hi;
+    u64 id_lo;
+    memcpy(&id_hi, rand_bytes, sizeof id_hi);
+    memcpy(&id_lo, rand_bytes + sizeof id_hi, sizeof id_lo);
     u8 id[64];
-    int id_len = snprintf((char *)id, sizeof id, "%s-%lld-%d", (const char *)ctx->node_id,
-                          (long long)now, (int)ctx->generate_ms_counter);
+    int id_len = snprintf((char *)id, sizeof id, "%016llx%016llx", (unsigned long long)id_hi,
+                          (unsigned long long)id_lo);
     if (id_len < 0 || (usize)id_len >= sizeof id) {
         res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 13,
                   ERR_GENERATE_ID);
