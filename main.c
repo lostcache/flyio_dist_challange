@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1242,6 +1243,10 @@ static void send_response(PendingResponseArr *res) {
 int main(void) {
     const usize JSON_PARSE_BUF_LEN = 65536;
     u8 msg[JSON_PARSE_BUF_LEN];
+
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        fatal("could not ignore SIGPIPE");
+    }
 
     ServerContext *ctx = server_context_new();
     if (ctx == NULL) {
