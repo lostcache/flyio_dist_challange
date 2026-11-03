@@ -34,6 +34,16 @@ _Static_assert((LOG_RING_BUF_SIZE & (LOG_RING_BUF_SIZE - 1)) == 0,
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
+typedef enum {
+    ERR_CODE_TIMEOUT = 0,
+    ERR_CODE_NOT_SUPPORTED = 10,
+    ERR_CODE_TEMPORARILY_UNAVAILABLE = 11,
+    ERR_CODE_MALFORMED_REQUEST = 12,
+    ERR_CODE_CRASH = 13,
+    ERR_CODE_ABORT = 14,
+    ERR_CODE_KEY_DOES_NOT_EXIST = 20,
+} ErrorCode;
+
 static const u8 ERR_MALFORMED_INIT[] = "malformed init message";
 static const u8 ERR_NODE_ID_TOO_LONG[] = "node id too long";
 static const u8 ERR_ECHO_TYPE[] = "incorrect echo type";
@@ -180,7 +190,7 @@ static void res_add(PendingResponseArr *res, const u8 *src, const u8 *dest, cJSO
 }
 
 static void res_error(PendingResponseArr *res, const u8 *src, const u8 *dest, u64 msg_id,
-                      u64 in_reply_to, i32 code, const u8 *text) {
+                      u64 in_reply_to, ErrorCode code, const u8 *text) {
     cJSON *body = reply_body(msg_id, (const u8 *)"error", in_reply_to);
     if (!cJSON_AddNumberToObject(body, "code", code) ||
         !cJSON_AddStringToObject(body, "text", (const char *)text)) {
@@ -287,8 +297,8 @@ static void reap_pending_reads(ServerContext *ctx, i64 now, PendingResponseArr *
         if (!pr->used || now < pr->deadline_ms) {
             continue;
         }
-        res_error(out, ctx->node_id, pr->client_src, ctx->next_msg_id++, pr->client_msg_id, 0,
-                  ERR_TIMEOUT);
+        res_error(out, ctx->node_id, pr->client_src, ctx->next_msg_id++, pr->client_msg_id,
+                  ERR_CODE_TIMEOUT, ERR_TIMEOUT);
         pr->used = false;
     }
 }
@@ -414,7 +424,7 @@ static PendingResponseArr handle_error(ServerContext *ctx, const Request *req) {
     const cJSON *code_ptr = cJSON_GetObjectItem(req->body, "code");
     i32 code = cJSON_IsNumber(code_ptr) ? code_ptr->valueint : -1;
 
-    if (code == 20) {
+    if (code == ERR_CODE_KEY_DOES_NOT_EXIST) {
         PendingKVReadAll *pr = find_pending_kv_read_all(ctx, in_reply_to);
         if (pr != NULL && --pr->remaining == 0) {
             body = reply_body(ctx->next_msg_id++, (const u8 *)"read_ok", pr->client_msg_id);
@@ -441,8 +451,8 @@ static PendingResponseArr handle_init(ServerContext *ctx, const Request *req) {
     }
 
     if (!cJSON_HasObjectItem(req->body, "node_id") || !cJSON_HasObjectItem(req->body, "node_ids")) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                  ERR_MALFORMED_INIT);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_MALFORMED_INIT);
         goto done;
     }
 
@@ -450,15 +460,15 @@ static PendingResponseArr handle_init(ServerContext *ctx, const Request *req) {
                 *node_ids = cJSON_GetObjectItem(req->body, "node_ids");
 
     if (!cJSON_IsString(node_id) || node_id->valuestring == NULL || !cJSON_IsArray(node_ids)) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                  ERR_MALFORMED_INIT);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_MALFORMED_INIT);
         goto done;
     }
 
     usize node_id_len = strlen(node_id->valuestring);
     if (node_id_len >= sizeof ctx->node_id) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 12,
-                  ERR_NODE_ID_TOO_LONG);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_NODE_ID_TOO_LONG);
         goto done;
     }
 
@@ -474,8 +484,8 @@ static PendingResponseArr handle_init(ServerContext *ctx, const Request *req) {
         }
     }
     if (node_ids_too_long) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 12,
-                  ERR_NODE_ID_TOO_LONG);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_NODE_ID_TOO_LONG);
         goto done;
     }
 
@@ -512,8 +522,8 @@ static PendingResponseArr handle_echo(ServerContext *ctx, const Request *req) {
 
     const cJSON *echo = cJSON_GetObjectItem(req->body, "echo");
     if (!cJSON_IsString(echo) || echo->valuestring == NULL) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 13,
-                  ERR_ECHO_TYPE);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_ECHO_TYPE);
         goto done;
     }
 
@@ -538,8 +548,8 @@ static PendingResponseArr handle_generate(ServerContext *ctx, const Request *req
     }
 
     if (!ctx->node_id_set) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                  ERR_GENERATE_BEFORE_INIT);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_TEMPORARILY_UNAVAILABLE, ERR_GENERATE_BEFORE_INIT);
         goto done;
     }
 
@@ -551,8 +561,8 @@ static PendingResponseArr handle_generate(ServerContext *ctx, const Request *req
             if (errno == EINTR) {
                 continue;
             }
-            res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 13,
-                      ERR_GENERATE_ID);
+            res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                      ERR_CODE_CRASH, ERR_GENERATE_ID);
             goto done;
         }
         rand_filled += (usize)n;
@@ -565,8 +575,8 @@ static PendingResponseArr handle_generate(ServerContext *ctx, const Request *req
     int id_len = snprintf((char *)id, sizeof id, "%016llx%016llx", (unsigned long long)id_hi,
                           (unsigned long long)id_lo);
     if (id_len < 0 || (usize)id_len >= sizeof id) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 13,
-                  ERR_GENERATE_ID);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_CRASH, ERR_GENERATE_ID);
         goto done;
     }
     body = reply_body(ctx->next_msg_id++, (const u8 *)"generate_ok", msg_id);
@@ -590,21 +600,21 @@ static PendingResponseArr handle_broadcast(ServerContext *ctx, const Request *re
     }
 
     if (ctx->bd_msg.size >= ctx->bd_msg.cap) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 11,
-                  ERR_BROADCAST_FULL);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_TEMPORARILY_UNAVAILABLE, ERR_BROADCAST_FULL);
         goto done;
     }
 
     if (!cJSON_HasObjectItem(req->body, "message")) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                  ERR_BROADCAST_TYPE);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_BROADCAST_TYPE);
         goto done;
     }
 
     const cJSON *msg_val = cJSON_GetObjectItem(req->body, "message");
     if (!cJSON_IsNumber(msg_val)) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                  ERR_BROADCAST_TYPE);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_BROADCAST_TYPE);
         goto done;
     }
 
@@ -626,8 +636,8 @@ static PendingResponseArr handle_read(ServerContext *ctx, const Request *req) {
 
     PendingKVReadAll *pr = alloc_pending_kv_read_all(ctx);
     if (pr == NULL) {
-        res_error(&res, ctx->node_id, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 11,
-                  ERR_TOO_MANY_PENDING_READS);
+        res_error(&res, ctx->node_id, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_TEMPORARILY_UNAVAILABLE, ERR_TOO_MANY_PENDING_READS);
         goto done;
     }
 
@@ -670,8 +680,8 @@ static PendingResponseArr handle_topology(ServerContext *ctx, const Request *req
     }
 
     if (!cJSON_HasObjectItem(req->body, "topology")) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                  ERR_TOPOLOGY_TYPE);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_TOPOLOGY_TYPE);
         goto done;
     }
 
@@ -691,22 +701,22 @@ static PendingResponseArr handle_add(ServerContext *ctx, const Request *req) {
     }
 
     if (!cJSON_HasObjectItem(req->body, "delta")) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                  ERR_INVALID_ADD);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_INVALID_ADD);
         goto done;
     }
 
     const cJSON *delta_obj = cJSON_GetObjectItem(req->body, "delta");
     if (!cJSON_IsNumber(delta_obj)) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                  ERR_INVALID_ADD);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_INVALID_ADD);
         goto done;
     }
 
     PendingKVAdd *pa = alloc_pending_read(ctx);
     if (pa == NULL) {
-        res_error(&res, ctx->node_id, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 11,
-                  ERR_TOO_MANY_PENDING_ADDS);
+        res_error(&res, ctx->node_id, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_TEMPORARILY_UNAVAILABLE, ERR_TOO_MANY_PENDING_ADDS);
         goto done;
     }
 
@@ -742,8 +752,8 @@ static PendingResponseArr handle_send(ServerContext *ctx, const Request *req) {
     }
 
     if (!cJSON_HasObjectItem(req->body, "key") || !cJSON_HasObjectItem(req->body, "msg")) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                  ERR_MALFORMED_SEND);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_MALFORMED_SEND);
         goto done;
     }
 
@@ -751,15 +761,15 @@ static PendingResponseArr handle_send(ServerContext *ctx, const Request *req) {
                 *msg_obj = cJSON_GetObjectItem(req->body, "msg");
 
     if (!cJSON_IsString(key_obj) || key_obj->valuestring == NULL || !cJSON_IsNumber(msg_obj)) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                  ERR_MALFORMED_SEND);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_MALFORMED_SEND);
         goto done;
     }
 
     usize key_len = strlen(key_obj->valuestring);
     if (key_len >= MAX_LOG_KEY_LEN) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 12,
-                  ERR_KEY_TOO_LONG);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_KEY_TOO_LONG);
         goto done;
     }
 
@@ -768,7 +778,7 @@ static PendingResponseArr handle_send(ServerContext *ctx, const Request *req) {
     if (log_idx == -1) {
         if (ctx->lb->next_log_idx >= MAX_LOGS) {
             res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
-                      11, ERR_TOO_MANY_LOGS);
+                      ERR_CODE_TEMPORARILY_UNAVAILABLE, ERR_TOO_MANY_LOGS);
             goto done;
         }
 
@@ -777,8 +787,8 @@ static PendingResponseArr handle_send(ServerContext *ctx, const Request *req) {
     }
 
     if (ctx->lb->next_log_offsets[log_idx] >= LOG_RING_BUF_SIZE) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 11,
-                  ERR_LOG_FULL);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_TEMPORARILY_UNAVAILABLE, ERR_LOG_FULL);
         goto done;
     }
 
@@ -809,8 +819,8 @@ static PendingResponseArr handle_poll(ServerContext *ctx, const Request *req) {
 
     const cJSON *offsets_obj = cJSON_GetObjectItem(req->body, "offsets");
     if (!cJSON_IsObject(offsets_obj)) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                  ERR_MALFORMED_POLL);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_MALFORMED_POLL);
         goto done;
     }
 
@@ -828,7 +838,7 @@ static PendingResponseArr handle_poll(ServerContext *ctx, const Request *req) {
         const char *key = it->string;
         if (key == NULL || !cJSON_IsNumber(it)) {
             res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
-                      69, ERR_MALFORMED_POLL);
+                      ERR_CODE_MALFORMED_REQUEST, ERR_MALFORMED_POLL);
             goto done;
         }
         const u64 offset = (u64)it->valuedouble;
@@ -841,7 +851,7 @@ static PendingResponseArr handle_poll(ServerContext *ctx, const Request *req) {
 
         if (offset > ctx->lb->next_log_offsets[log_idx]) {
             res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
-                      69, ERR_INVALID_READ);
+                      ERR_CODE_MALFORMED_REQUEST, ERR_INVALID_READ);
             goto done;
         }
 
@@ -914,8 +924,8 @@ static PendingResponseArr handle_commit_offsets(ServerContext *ctx, const Reques
 
     const cJSON *offsets_obj = cJSON_GetObjectItem(req->body, "offsets");
     if (!cJSON_IsObject(offsets_obj)) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                  ERR_MALFORMED_COMMIT);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_MALFORMED_COMMIT);
         goto done;
     }
 
@@ -924,7 +934,7 @@ static PendingResponseArr handle_commit_offsets(ServerContext *ctx, const Reques
         const char *key = it->string;
         if (key == NULL || !cJSON_IsNumber(it)) {
             res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
-                      69, ERR_MALFORMED_COMMIT);
+                      ERR_CODE_MALFORMED_REQUEST, ERR_MALFORMED_COMMIT);
             goto done;
         }
         const u64 offset_val = (u64)it->valuedouble;
@@ -961,8 +971,8 @@ static PendingResponseArr handle_list_committed_offsets(ServerContext *ctx, cons
 
     const cJSON *keys_arr_obj = cJSON_GetObjectItem(req->body, "keys");
     if (!keys_arr_obj || !cJSON_IsArray(keys_arr_obj)) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                  ERR_MALFORMED_LIST);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_MALFORMED_LIST);
         goto done;
     }
 
@@ -978,7 +988,7 @@ static PendingResponseArr handle_list_committed_offsets(ServerContext *ctx, cons
     cJSON_ArrayForEach(it, keys_arr_obj) {
         if (!cJSON_IsString(it) || it->valuestring == NULL) {
             res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
-                      69, ERR_MALFORMED_LIST);
+                      ERR_CODE_MALFORMED_REQUEST, ERR_MALFORMED_LIST);
             goto done;
         }
 
@@ -1013,8 +1023,8 @@ static PendingResponseArr handle_txn(ServerContext *ctx, const Request *req) {
 
     const cJSON *txn_arr_obj = cJSON_GetObjectItem(req->body, "txn");
     if (!txn_arr_obj || !cJSON_IsArray(txn_arr_obj)) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                  ERR_MALFORMED_TXN);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_MALFORMED_TXN);
         goto done;
     }
 
@@ -1133,14 +1143,14 @@ static PendingResponseArr handle_txn(ServerContext *ctx, const Request *req) {
     }
 
     if (kv_full) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 11,
-                  ERR_KV_FULL);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_TEMPORARILY_UNAVAILABLE, ERR_KV_FULL);
         goto done;
     }
 
     if (error_in_foreach) {
-        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                  ERR_MALFORMED_TXN);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                  ERR_CODE_MALFORMED_REQUEST, ERR_MALFORMED_TXN);
         goto done;
     }
 
@@ -1195,7 +1205,7 @@ static PendingResponseArr handle_request(ServerContext *ctx, const Request *req)
         u64 msg_id;
         if (request_msg_id(req, &msg_id)) {
             res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
-                      10, ERR_NOT_SUPPORTED);
+                      ERR_CODE_NOT_SUPPORTED, ERR_NOT_SUPPORTED);
         }
         return res;
     }
