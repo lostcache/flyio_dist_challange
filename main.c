@@ -3,11 +3,9 @@
 #include <limits.h>
 #include <poll.h>
 #include <stddef.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/random.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -16,10 +14,12 @@
 #define MAX_NODES 128
 #define MAX_NODE_NAME_LEN 16
 #define MAX_PENDING 256
+
+#define MAX_OUTGOING (MAX_PENDING + 1)
+
 #define PENDING_READ_TIMEOUT_MS 5000
 
 #define MAX_LOGS 1024
-#define MAX_LOG_KEY_LEN 16
 #define MAX_LOG_KEY_LEN 16
 #define LOG_RING_BUF_SIZE 128
 
@@ -55,6 +55,25 @@ static const u8 ERR_KV_FULL[] = "kv table full";
 static const u8 ERR_MALFORMED_TXN[] = "malformed txn msg";
 static const u8 ERR_NOT_SUPPORTED[] = "not supported";
 static const u8 ERR_TIMEOUT[] = "timeout";
+
+typedef struct {
+    const char *src;
+    const char *dest;
+    const cJSON *body;
+    u64 msg_id;
+    bool has_msg_id;
+} Request;
+
+typedef struct {
+    u8 src[MAX_NODE_NAME_LEN];
+    u8 dest[MAX_NODE_NAME_LEN];
+    cJSON *body;
+} Response;
+
+typedef struct {
+    Response items[MAX_OUTGOING];
+    usize count;
+} PendingResponseArr;
 
 typedef struct {
     i32 msg_vals[4096];
@@ -110,20 +129,107 @@ typedef struct {
     PendingKVReadAll pending_read_alls[MAX_PENDING];
 } ServerContext;
 
-typedef struct {
-    const char *src;
-    const char *dest;
-    const cJSON *body;
-    u64 msg_id;
-    bool has_msg_id;
-} Request;
-
-typedef void (*Handler)(ServerContext *ctx, const Request *req);
+typedef PendingResponseArr (*RequestHandler)(ServerContext *ctx, const Request *req);
 
 typedef struct {
     const char *name;
-    Handler handler;
-} HandlerEntry;
+    RequestHandler handler;
+} RequestHandlerEntry;
+
+static _Noreturn void fatal(const char *message) {
+    fprintf(stderr, "fatal: %s\n", message);
+    exit(EXIT_FAILURE);
+}
+
+static i64 now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (i64)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static cJSON *reply_body(u64 msg_id, const u8 *type, u64 in_reply_to) {
+    cJSON *body = cJSON_CreateObject();
+    if (!body) {
+        fatal("could not create reply body");
+    }
+    if (!cJSON_AddStringToObject(body, "type", (const char *)type) ||
+        !cJSON_AddNumberToObject(body, "msg_id", (double)msg_id) ||
+        !cJSON_AddNumberToObject(body, "in_reply_to", (double)in_reply_to)) {
+        cJSON_Delete(body);
+        fatal("could not build reply body");
+    }
+    return body;
+}
+
+static void res_add(PendingResponseArr *res, const u8 *src, const u8 *dest, cJSON *body) {
+    usize src_len = strlen((const char *)src);
+    usize dest_len = strlen((const char *)dest);
+    if (src_len >= MAX_NODE_NAME_LEN || dest_len >= MAX_NODE_NAME_LEN) {
+        cJSON_Delete(body);
+        fatal("outgoing node name too long");
+    }
+    if (res->count >= MAX_OUTGOING) {
+        cJSON_Delete(body);
+        fatal("too many outgoing messages");
+    }
+
+    Response *out = &res->items[res->count++];
+    memcpy(out->src, src, src_len + 1);
+    memcpy(out->dest, dest, dest_len + 1);
+    out->body = body;
+}
+
+static void res_error(PendingResponseArr *res, const u8 *src, const u8 *dest, u64 msg_id,
+                      u64 in_reply_to, i32 code, const u8 *text) {
+    cJSON *body = reply_body(msg_id, (const u8 *)"error", in_reply_to);
+    if (!cJSON_AddNumberToObject(body, "code", code) ||
+        !cJSON_AddStringToObject(body, "text", (const char *)text)) {
+        cJSON_Delete(body);
+        fatal("could not build error reply");
+    }
+    res_add(res, src, dest, body);
+}
+
+static void response_free(PendingResponseArr *res) {
+    for (usize i = 0; i < res->count; ++i) {
+        cJSON_Delete(res->items[i].body);
+    }
+    res->count = 0;
+}
+
+static ServerContext *server_context_new(void) {
+    ServerContext *ctx = calloc(1, sizeof *ctx);
+    if (!ctx) {
+        return NULL;
+    }
+
+    ctx->lb = calloc(1, sizeof *ctx->lb);
+    if (!ctx->lb) {
+        free(ctx);
+        return NULL;
+    }
+
+    ctx->kvs = calloc(1, sizeof *ctx->kvs);
+    if (!ctx->kvs) {
+        free(ctx->lb);
+        free(ctx);
+        return NULL;
+    }
+
+    ctx->bd_msg.cap = 4096;
+    ctx->next_msg_id = 1;
+    ctx->prev_generate_time_ms = now_ms();
+    return ctx;
+}
+
+static void server_context_free(ServerContext *ctx) {
+    if (ctx == NULL) {
+        return;
+    }
+    free(ctx->kvs);
+    free(ctx->lb);
+    free(ctx);
+}
 
 static PendingKVAdd *find_pending_add(ServerContext *ctx, u64 kv_msg_id) {
     for (usize i = 0; i < MAX_PENDING; ++i) {
@@ -175,89 +281,21 @@ static i64 find_kv_entry_idx_by_key(KVStore *kvs, i64 key) {
     return -1;
 }
 
-static i64 now_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (i64)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-}
-
-// Prints a message and stops the program. Use only when a reply cannot be built.
-static _Noreturn void fatal(const char *message) {
-    fprintf(stderr, "fatal: %s\n", message);
-    exit(EXIT_FAILURE);
-}
-
-// Builds a reply body with the fields every reply needs.
-static cJSON *reply_body(u64 msg_id, const u8 *type, u64 in_reply_to) {
-    cJSON *body = cJSON_CreateObject();
-    if (!body) {
-        fatal("could not create reply body");
-    }
-    if (!cJSON_AddStringToObject(body, "type", (const char *)type) ||
-        !cJSON_AddNumberToObject(body, "msg_id", (double)msg_id) ||
-        !cJSON_AddNumberToObject(body, "in_reply_to", (double)in_reply_to)) {
-        cJSON_Delete(body);
-        fatal("could not build reply body");
-    }
-    return body;
-}
-
-// Wraps a body into an envelope and writes it to stdout.
-static void send(const u8 *src, const u8 *dest, cJSON *body) {
-    cJSON *res = cJSON_CreateObject();
-    if (!res) {
-        cJSON_Delete(body);
-        fatal("could not create reply envelope");
-    }
-    if (!cJSON_AddStringToObject(res, "src", (const char *)src) ||
-        !cJSON_AddStringToObject(res, "dest", (const char *)dest) ||
-        !cJSON_AddItemToObject(res, "body", body)) {
-        cJSON_Delete(res);
-        cJSON_Delete(body);
-        fatal("could not build reply envelope");
-    }
-
-    char *out = cJSON_PrintUnformatted(res);
-    if (!out) {
-        cJSON_Delete(res);
-        fatal("could not serialize reply");
-    }
-    if (printf("%s\n", out) < 0 || fflush(stdout) != 0) {
-        free(out);
-        cJSON_Delete(res);
-        fatal("could not write reply");
-    }
-
-    free(out);
-    cJSON_Delete(res);
-}
-
-static void send_error(const u8 *src, const u8 *dest, u64 msg_id, u64 in_reply_to, i32 code,
-                       const u8 *text) {
-    cJSON *body = reply_body(msg_id, (const u8 *)"error", in_reply_to);
-    if (!cJSON_AddNumberToObject(body, "code", code) ||
-        !cJSON_AddStringToObject(body, "text", (const char *)text)) {
-        cJSON_Delete(body);
-        fatal("could not build error reply");
-    }
-    send(src, dest, body);
-}
-
 // Answers expired pending reads with a timeout error and releases their slots.
-static void reap_pending_reads(ServerContext *ctx, i64 now) {
+static void reap_pending_reads(ServerContext *ctx, i64 now, PendingResponseArr *out) {
     for (usize i = 0; i < MAX_PENDING; ++i) {
         PendingKVReadAll *pr = &ctx->pending_read_alls[i];
         if (!pr->used || now < pr->deadline_ms) {
             continue;
         }
-        send_error(ctx->node_id, pr->client_src, ctx->next_msg_id++, pr->client_msg_id, 0,
-                   ERR_TIMEOUT);
+        res_error(out, ctx->node_id, pr->client_src, ctx->next_msg_id++, pr->client_msg_id, 0,
+                  ERR_TIMEOUT);
         pr->used = false;
     }
 }
 
 // Returns the poll timeout for the earliest pending read, or -1 when none is pending.
-static int pending_read_timeout_ms(ServerContext *ctx, i64 now) {
+static int pending_read_timeout_ms(const ServerContext *ctx, i64 now) {
     bool found = false;
     i64 earliest = 0;
     for (usize i = 0; i < MAX_PENDING; ++i) {
@@ -301,8 +339,9 @@ static bool request_msg_id(const Request *req, u64 *msg_id) {
     return true;
 }
 
-static void handle_read_ok(ServerContext *ctx, const Request *req) {
-    cJSON *res_body = NULL;
+static PendingResponseArr handle_read_ok(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
+    cJSON *body = NULL;
 
     if (!cJSON_HasObjectItem(req->body, "value")) {
         goto done;
@@ -327,21 +366,23 @@ static void handle_read_ok(ServerContext *ctx, const Request *req) {
 
     pr->sum += (i64)value;
     if (--pr->remaining == 0) {
-        res_body = reply_body(ctx->next_msg_id++, (const u8 *)"read_ok", pr->client_msg_id);
-        if (!cJSON_AddNumberToObject(res_body, "value", (double)pr->sum)) {
-            cJSON_Delete(res_body);
+        body = reply_body(ctx->next_msg_id++, (const u8 *)"read_ok", pr->client_msg_id);
+        if (!cJSON_AddNumberToObject(body, "value", (double)pr->sum)) {
+            cJSON_Delete(body);
             fatal("could not build read reply");
         }
-        send(ctx->node_id, pr->client_src, res_body);
-        res_body = NULL;
+        res_add(&res, ctx->node_id, pr->client_src, body);
+        body = NULL;
         pr->used = false;
     }
 done:
-    cJSON_Delete(res_body);
+    cJSON_Delete(body);
+    return res;
 }
 
-static void handle_write_ok(ServerContext *ctx, const Request *req) {
-    cJSON *res_body = NULL;
+static PendingResponseArr handle_write_ok(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
+    cJSON *body = NULL;
 
     const cJSON *reply_ptr = cJSON_GetObjectItem(req->body, "in_reply_to");
     if (!cJSON_IsNumber(reply_ptr)) {
@@ -351,17 +392,19 @@ static void handle_write_ok(ServerContext *ctx, const Request *req) {
 
     PendingKVAdd *p = find_pending_add(ctx, in_reply_to);
     if (p != NULL) {
-        res_body = reply_body(ctx->next_msg_id++, (const u8 *)"add_ok", p->client_msg_id);
-        send(ctx->node_id, p->client_src, res_body);
-        res_body = NULL;
+        body = reply_body(ctx->next_msg_id++, (const u8 *)"add_ok", p->client_msg_id);
+        res_add(&res, ctx->node_id, p->client_src, body);
+        body = NULL;
         p->used = false;
     }
 done:
-    cJSON_Delete(res_body);
+    cJSON_Delete(body);
+    return res;
 }
 
-static void handle_error(ServerContext *ctx, const Request *req) {
-    cJSON *res_body = NULL;
+static PendingResponseArr handle_error(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
+    cJSON *body = NULL;
 
     const cJSON *reply_ptr = cJSON_GetObjectItem(req->body, "in_reply_to");
     if (!cJSON_IsNumber(reply_ptr)) {
@@ -375,32 +418,32 @@ static void handle_error(ServerContext *ctx, const Request *req) {
     if (code == 20) {
         PendingKVReadAll *pr = find_pending_kv_read_all(ctx, in_reply_to);
         if (pr != NULL && --pr->remaining == 0) {
-            res_body =
-                reply_body(ctx->next_msg_id++, (const u8 *)"read_ok", pr->client_msg_id);
-            if (!cJSON_AddNumberToObject(res_body, "value", (double)pr->sum)) {
-                cJSON_Delete(res_body);
+            body = reply_body(ctx->next_msg_id++, (const u8 *)"read_ok", pr->client_msg_id);
+            if (!cJSON_AddNumberToObject(body, "value", (double)pr->sum)) {
+                cJSON_Delete(body);
                 fatal("could not build read reply");
             }
-            send(ctx->node_id, pr->client_src, res_body);
-            res_body = NULL;
+            res_add(&res, ctx->node_id, pr->client_src, body);
+            body = NULL;
             pr->used = false;
         }
     }
 done:
-    cJSON_Delete(res_body);
+    cJSON_Delete(body);
+    return res;
 }
 
-static void handle_init(ServerContext *ctx, const Request *req) {
-    cJSON *res_body = NULL;
+static PendingResponseArr handle_init(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
+    cJSON *body = NULL;
     u64 msg_id;
     if (!request_msg_id(req, &msg_id)) {
         goto done;
     }
 
-    if (!cJSON_HasObjectItem(req->body, "node_id") ||
-        !cJSON_HasObjectItem(req->body, "node_ids")) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                   ERR_MALFORMED_INIT);
+    if (!cJSON_HasObjectItem(req->body, "node_id") || !cJSON_HasObjectItem(req->body, "node_ids")) {
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
+                  ERR_MALFORMED_INIT);
         goto done;
     }
 
@@ -408,15 +451,15 @@ static void handle_init(ServerContext *ctx, const Request *req) {
                 *node_ids = cJSON_GetObjectItem(req->body, "node_ids");
 
     if (!cJSON_IsString(node_id) || node_id->valuestring == NULL || !cJSON_IsArray(node_ids)) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                   ERR_MALFORMED_INIT);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
+                  ERR_MALFORMED_INIT);
         goto done;
     }
 
     usize node_id_len = strlen(node_id->valuestring);
     if (node_id_len >= sizeof ctx->node_id) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 12,
-                   ERR_NODE_ID_TOO_LONG);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 12,
+                  ERR_NODE_ID_TOO_LONG);
         goto done;
     }
 
@@ -432,8 +475,8 @@ static void handle_init(ServerContext *ctx, const Request *req) {
         }
     }
     if (node_ids_too_long) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 12,
-                   ERR_NODE_ID_TOO_LONG);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 12,
+                  ERR_NODE_ID_TOO_LONG);
         goto done;
     }
 
@@ -452,15 +495,17 @@ static void handle_init(ServerContext *ctx, const Request *req) {
         ++ctx->next_node_idx;
     }
 
-    res_body = reply_body(ctx->next_msg_id++, (const u8 *)"init_ok", msg_id);
-    send((const u8 *)req->dest, (const u8 *)req->src, res_body);
-    res_body = NULL;
+    body = reply_body(ctx->next_msg_id++, (const u8 *)"init_ok", msg_id);
+    res_add(&res, (const u8 *)req->dest, (const u8 *)req->src, body);
+    body = NULL;
 done:
-    cJSON_Delete(res_body);
+    cJSON_Delete(body);
+    return res;
 }
 
-static void handle_echo(ServerContext *ctx, const Request *req) {
-    cJSON *res_body = NULL;
+static PendingResponseArr handle_echo(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
+    cJSON *body = NULL;
     u64 msg_id;
     if (!request_msg_id(req, &msg_id)) {
         goto done;
@@ -468,32 +513,34 @@ static void handle_echo(ServerContext *ctx, const Request *req) {
 
     const cJSON *echo = cJSON_GetObjectItem(req->body, "echo");
     if (!cJSON_IsString(echo) || echo->valuestring == NULL) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 13,
-                   ERR_ECHO_TYPE);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 13,
+                  ERR_ECHO_TYPE);
         goto done;
     }
 
-    res_body = reply_body(ctx->next_msg_id++, (const u8 *)"echo_ok", msg_id);
-    if (!cJSON_AddStringToObject(res_body, "echo", echo->valuestring)) {
-        cJSON_Delete(res_body);
+    body = reply_body(ctx->next_msg_id++, (const u8 *)"echo_ok", msg_id);
+    if (!cJSON_AddStringToObject(body, "echo", echo->valuestring)) {
+        cJSON_Delete(body);
         fatal("could not build echo reply");
     }
-    send((const u8 *)req->dest, (const u8 *)req->src, res_body);
-    res_body = NULL;
+    res_add(&res, (const u8 *)req->dest, (const u8 *)req->src, body);
+    body = NULL;
 done:
-    cJSON_Delete(res_body);
+    cJSON_Delete(body);
+    return res;
 }
 
-static void handle_generate(ServerContext *ctx, const Request *req) {
-    cJSON *res_body = NULL;
+static PendingResponseArr handle_generate(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
+    cJSON *body = NULL;
     u64 msg_id;
     if (!request_msg_id(req, &msg_id)) {
         goto done;
     }
 
     if (!ctx->node_id_set) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                   ERR_GENERATE_BEFORE_INIT);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
+                  ERR_GENERATE_BEFORE_INIT);
         goto done;
     }
 
@@ -516,56 +563,60 @@ static void handle_generate(ServerContext *ctx, const Request *req) {
     int id_len = snprintf((char *)id, sizeof id, "%s-%lld-%d", (const char *)ctx->node_id,
                           (long long)now, (int)ctx->generate_ms_counter);
     if (id_len < 0 || (usize)id_len >= sizeof id) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 13,
-                   ERR_GENERATE_ID);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 13,
+                  ERR_GENERATE_ID);
         goto done;
     }
-    res_body = reply_body(ctx->next_msg_id++, (const u8 *)"generate_ok", msg_id);
-    if (!cJSON_AddStringToObject(res_body, "id", (const char *)id)) {
-        cJSON_Delete(res_body);
+    body = reply_body(ctx->next_msg_id++, (const u8 *)"generate_ok", msg_id);
+    if (!cJSON_AddStringToObject(body, "id", (const char *)id)) {
+        cJSON_Delete(body);
         fatal("could not build generate reply");
     }
-    send((const u8 *)req->dest, (const u8 *)req->src, res_body);
-    res_body = NULL;
+    res_add(&res, (const u8 *)req->dest, (const u8 *)req->src, body);
+    body = NULL;
 done:
-    cJSON_Delete(res_body);
+    cJSON_Delete(body);
+    return res;
 }
 
-static void handle_broadcast(ServerContext *ctx, const Request *req) {
-    cJSON *res_body = NULL;
+static PendingResponseArr handle_broadcast(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
+    cJSON *body = NULL;
     u64 msg_id;
     if (!request_msg_id(req, &msg_id)) {
         goto done;
     }
 
     if (ctx->bd_msg.size >= ctx->bd_msg.cap) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 11,
-                   ERR_BROADCAST_FULL);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 11,
+                  ERR_BROADCAST_FULL);
         goto done;
     }
 
     if (!cJSON_HasObjectItem(req->body, "message")) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                   ERR_BROADCAST_TYPE);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
+                  ERR_BROADCAST_TYPE);
         goto done;
     }
 
     const cJSON *msg_val = cJSON_GetObjectItem(req->body, "message");
     if (!cJSON_IsNumber(msg_val)) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                   ERR_BROADCAST_TYPE);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
+                  ERR_BROADCAST_TYPE);
         goto done;
     }
 
     ctx->bd_msg.msg_vals[ctx->bd_msg.size++] = msg_val->valueint;
-    res_body = reply_body(ctx->next_msg_id++, (const u8 *)"broadcast_ok", msg_id);
-    send((const u8 *)req->dest, (const u8 *)req->src, res_body);
-    res_body = NULL;
+    body = reply_body(ctx->next_msg_id++, (const u8 *)"broadcast_ok", msg_id);
+    res_add(&res, (const u8 *)req->dest, (const u8 *)req->src, body);
+    body = NULL;
 done:
-    cJSON_Delete(res_body);
+    cJSON_Delete(body);
+    return res;
 }
 
-static void handle_read(ServerContext *ctx, const Request *req) {
+static PendingResponseArr handle_read(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
     u64 msg_id;
     if (!request_msg_id(req, &msg_id)) {
         goto done;
@@ -573,8 +624,8 @@ static void handle_read(ServerContext *ctx, const Request *req) {
 
     PendingKVReadAll *pr = alloc_pending_kv_read_all(ctx);
     if (pr == NULL) {
-        send_error(ctx->node_id, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 11,
-                   ERR_TOO_MANY_PENDING_READS);
+        res_error(&res, ctx->node_id, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 11,
+                  ERR_TOO_MANY_PENDING_READS);
         goto done;
     }
 
@@ -588,69 +639,72 @@ static void handle_read(ServerContext *ctx, const Request *req) {
     pr->deadline_ms = now_ms() + PENDING_READ_TIMEOUT_MS;
 
     for (usize i = 0; i < ctx->next_node_idx; ++i) {
-        cJSON *res_body = cJSON_CreateObject();
-        if (!res_body) {
+        cJSON *body = cJSON_CreateObject();
+        if (!body) {
             fatal("could not create read request");
         }
         u64 kv_id = ctx->next_msg_id++;
 
-        if (!cJSON_AddStringToObject(res_body, "type", "read") ||
-            !cJSON_AddStringToObject(res_body, "key", (const char *)ctx->node_ids[i]) ||
-            !cJSON_AddNumberToObject(res_body, "msg_id", (double)kv_id)) {
-            cJSON_Delete(res_body);
+        if (!cJSON_AddStringToObject(body, "type", "read") ||
+            !cJSON_AddStringToObject(body, "key", (const char *)ctx->node_ids[i]) ||
+            !cJSON_AddNumberToObject(body, "msg_id", (double)kv_id)) {
+            cJSON_Delete(body);
             fatal("could not build read request");
         }
 
         pr->kv_read_msg_ids[pr->kv_count++] = kv_id;
-        send(ctx->node_id, (const u8 *)"seq-kv", res_body);
+        res_add(&res, ctx->node_id, (const u8 *)"seq-kv", body);
     }
 done:
-    return;
+    return res;
 }
 
-static void handle_topology(ServerContext *ctx, const Request *req) {
-    cJSON *res_body = NULL;
+static PendingResponseArr handle_topology(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
+    cJSON *body = NULL;
     u64 msg_id;
     if (!request_msg_id(req, &msg_id)) {
         goto done;
     }
 
     if (!cJSON_HasObjectItem(req->body, "topology")) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                   ERR_TOPOLOGY_TYPE);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
+                  ERR_TOPOLOGY_TYPE);
         goto done;
     }
 
-    res_body = reply_body(ctx->next_msg_id++, (const u8 *)"topology_ok", msg_id);
-    send((const u8 *)req->dest, (const u8 *)req->src, res_body);
-    res_body = NULL;
+    body = reply_body(ctx->next_msg_id++, (const u8 *)"topology_ok", msg_id);
+    res_add(&res, (const u8 *)req->dest, (const u8 *)req->src, body);
+    body = NULL;
 done:
-    cJSON_Delete(res_body);
+    cJSON_Delete(body);
+    return res;
 }
 
-static void handle_add(ServerContext *ctx, const Request *req) {
+static PendingResponseArr handle_add(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
     u64 msg_id;
     if (!request_msg_id(req, &msg_id)) {
         goto done;
     }
 
     if (!cJSON_HasObjectItem(req->body, "delta")) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                   ERR_INVALID_ADD);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
+                  ERR_INVALID_ADD);
         goto done;
     }
 
     const cJSON *delta_obj = cJSON_GetObjectItem(req->body, "delta");
     if (!cJSON_IsNumber(delta_obj)) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                   ERR_INVALID_ADD);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
+                  ERR_INVALID_ADD);
         goto done;
     }
 
     PendingKVAdd *pa = alloc_pending_read(ctx);
     if (pa == NULL) {
-        send_error(ctx->node_id, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 11,
-                   ERR_TOO_MANY_PENDING_ADDS);
+        res_error(&res, ctx->node_id, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 11,
+                  ERR_TOO_MANY_PENDING_ADDS);
         goto done;
     }
 
@@ -661,32 +715,33 @@ static void handle_add(ServerContext *ctx, const Request *req) {
     memcpy(pa->client_src, req->src, src_len + 1);
 
     ctx->counter += (i64)delta_obj->valuedouble;
-    cJSON *res_body = cJSON_CreateObject();
-    if (!res_body) {
+    cJSON *body = cJSON_CreateObject();
+    if (!body) {
         fatal("could not create write request");
     }
-    if (!cJSON_AddStringToObject(res_body, "type", "write") ||
-        !cJSON_AddStringToObject(res_body, "key", (const char *)ctx->node_id) ||
-        !cJSON_AddNumberToObject(res_body, "value", (double)ctx->counter) ||
-        !cJSON_AddNumberToObject(res_body, "msg_id", (double)pa->kv_msg_id)) {
-        cJSON_Delete(res_body);
+    if (!cJSON_AddStringToObject(body, "type", "write") ||
+        !cJSON_AddStringToObject(body, "key", (const char *)ctx->node_id) ||
+        !cJSON_AddNumberToObject(body, "value", (double)ctx->counter) ||
+        !cJSON_AddNumberToObject(body, "msg_id", (double)pa->kv_msg_id)) {
+        cJSON_Delete(body);
         fatal("could not build write request");
     }
-    send(ctx->node_id, (const u8 *)"seq-kv", res_body);
+    res_add(&res, ctx->node_id, (const u8 *)"seq-kv", body);
 done:
-    return;
+    return res;
 }
 
-static void handle_send(ServerContext *ctx, const Request *req) {
-    cJSON *res_body = NULL;
+static PendingResponseArr handle_send(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
+    cJSON *body = NULL;
     u64 msg_id;
     if (!request_msg_id(req, &msg_id)) {
         goto done;
     }
 
     if (!cJSON_HasObjectItem(req->body, "key") || !cJSON_HasObjectItem(req->body, "msg")) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                   ERR_MALFORMED_SEND);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
+                  ERR_MALFORMED_SEND);
         goto done;
     }
 
@@ -694,15 +749,15 @@ static void handle_send(ServerContext *ctx, const Request *req) {
                 *msg_obj = cJSON_GetObjectItem(req->body, "msg");
 
     if (!cJSON_IsString(key_obj) || key_obj->valuestring == NULL || !cJSON_IsNumber(msg_obj)) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                   ERR_MALFORMED_SEND);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
+                  ERR_MALFORMED_SEND);
         goto done;
     }
 
     usize key_len = strlen(key_obj->valuestring);
     if (key_len >= MAX_LOG_KEY_LEN) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 12,
-                   ERR_KEY_TOO_LONG);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 12,
+                  ERR_KEY_TOO_LONG);
         goto done;
     }
 
@@ -710,8 +765,8 @@ static void handle_send(ServerContext *ctx, const Request *req) {
 
     if (log_idx == -1) {
         if (ctx->lb->next_log_idx >= MAX_LOGS) {
-            send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
-                       11, ERR_TOO_MANY_LOGS);
+            res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                      11, ERR_TOO_MANY_LOGS);
             goto done;
         }
 
@@ -720,8 +775,8 @@ static void handle_send(ServerContext *ctx, const Request *req) {
     }
 
     if (ctx->lb->next_log_offsets[log_idx] >= LOG_RING_BUF_SIZE) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 11,
-                   ERR_LOG_FULL);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 11,
+                  ERR_LOG_FULL);
         goto done;
     }
 
@@ -729,20 +784,21 @@ static void handle_send(ServerContext *ctx, const Request *req) {
         (i64)msg_obj->valuedouble;
     ++ctx->lb->next_log_offsets[log_idx];
 
-    res_body = reply_body(ctx->next_msg_id++, (const u8 *)"send_ok", msg_id);
-    if (!cJSON_AddNumberToObject(res_body, "offset",
-                                 (double)ctx->lb->next_log_offsets[log_idx] - 1)) {
-        cJSON_Delete(res_body);
+    body = reply_body(ctx->next_msg_id++, (const u8 *)"send_ok", msg_id);
+    if (!cJSON_AddNumberToObject(body, "offset", (double)ctx->lb->next_log_offsets[log_idx] - 1)) {
+        cJSON_Delete(body);
         fatal("could not build send reply");
     }
 
-    send((const u8 *)req->dest, (const u8 *)req->src, res_body);
-    res_body = NULL;
+    res_add(&res, (const u8 *)req->dest, (const u8 *)req->src, body);
+    body = NULL;
 done:
-    cJSON_Delete(res_body);
+    cJSON_Delete(body);
+    return res;
 }
 
-static void handle_poll(ServerContext *ctx, const Request *req) {
+static PendingResponseArr handle_poll(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
     cJSON *poll_res_obj = NULL;
     u64 msg_id;
     if (!request_msg_id(req, &msg_id)) {
@@ -751,8 +807,8 @@ static void handle_poll(ServerContext *ctx, const Request *req) {
 
     const cJSON *offsets_obj = cJSON_GetObjectItem(req->body, "offsets");
     if (!cJSON_IsObject(offsets_obj)) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                   ERR_MALFORMED_POLL);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
+                  ERR_MALFORMED_POLL);
         goto done;
     }
 
@@ -769,8 +825,8 @@ static void handle_poll(ServerContext *ctx, const Request *req) {
     while (it) {
         const char *key = it->string;
         if (key == NULL || !cJSON_IsNumber(it)) {
-            send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
-                       69, ERR_MALFORMED_POLL);
+            res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                      69, ERR_MALFORMED_POLL);
             goto done;
         }
         const u64 offset = (u64)it->valuedouble;
@@ -782,8 +838,8 @@ static void handle_poll(ServerContext *ctx, const Request *req) {
         }
 
         if (offset > ctx->lb->next_log_offsets[log_idx]) {
-            send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
-                       69, ERR_INVALID_READ);
+            res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                      69, ERR_INVALID_READ);
             goto done;
         }
 
@@ -839,14 +895,16 @@ static void handle_poll(ServerContext *ctx, const Request *req) {
         it = it->next;
     }
 
-    send((const u8 *)req->dest, (const u8 *)req->src, poll_res_obj);
+    res_add(&res, (const u8 *)req->dest, (const u8 *)req->src, poll_res_obj);
     poll_res_obj = NULL;
 done:
     cJSON_Delete(poll_res_obj);
+    return res;
 }
 
-static void handle_commit_offsets(ServerContext *ctx, const Request *req) {
-    cJSON *res_body = NULL;
+static PendingResponseArr handle_commit_offsets(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
+    cJSON *body = NULL;
     u64 msg_id;
     if (!request_msg_id(req, &msg_id)) {
         goto done;
@@ -854,8 +912,8 @@ static void handle_commit_offsets(ServerContext *ctx, const Request *req) {
 
     const cJSON *offsets_obj = cJSON_GetObjectItem(req->body, "offsets");
     if (!cJSON_IsObject(offsets_obj)) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                   ERR_MALFORMED_COMMIT);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
+                  ERR_MALFORMED_COMMIT);
         goto done;
     }
 
@@ -863,8 +921,8 @@ static void handle_commit_offsets(ServerContext *ctx, const Request *req) {
     while (it) {
         const char *key = it->string;
         if (key == NULL || !cJSON_IsNumber(it)) {
-            send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
-                       69, ERR_MALFORMED_COMMIT);
+            res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                      69, ERR_MALFORMED_COMMIT);
             goto done;
         }
         const u64 offset_val = (u64)it->valuedouble;
@@ -883,15 +941,17 @@ static void handle_commit_offsets(ServerContext *ctx, const Request *req) {
         it = it->next;
     }
 
-    res_body = reply_body(ctx->next_msg_id++, (const u8 *)"commit_offsets_ok", msg_id);
-    send((const u8 *)req->dest, (const u8 *)req->src, res_body);
-    res_body = NULL;
+    body = reply_body(ctx->next_msg_id++, (const u8 *)"commit_offsets_ok", msg_id);
+    res_add(&res, (const u8 *)req->dest, (const u8 *)req->src, body);
+    body = NULL;
 done:
-    cJSON_Delete(res_body);
+    cJSON_Delete(body);
+    return res;
 }
 
-static void handle_list_committed_offsets(ServerContext *ctx, const Request *req) {
-    cJSON *res_body = NULL;
+static PendingResponseArr handle_list_committed_offsets(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
+    cJSON *body = NULL;
     u64 msg_id;
     if (!request_msg_id(req, &msg_id)) {
         goto done;
@@ -899,24 +959,24 @@ static void handle_list_committed_offsets(ServerContext *ctx, const Request *req
 
     const cJSON *keys_arr_obj = cJSON_GetObjectItem(req->body, "keys");
     if (!keys_arr_obj || !cJSON_IsArray(keys_arr_obj)) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                   ERR_MALFORMED_LIST);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
+                  ERR_MALFORMED_LIST);
         goto done;
     }
 
-    res_body = reply_body(ctx->next_msg_id++, (const u8 *)"list_committed_offsets_ok", msg_id);
+    body = reply_body(ctx->next_msg_id++, (const u8 *)"list_committed_offsets_ok", msg_id);
 
-    cJSON *res_offsets_obj = cJSON_AddObjectToObject(res_body, "offsets");
+    cJSON *res_offsets_obj = cJSON_AddObjectToObject(body, "offsets");
     if (!res_offsets_obj) {
-        cJSON_Delete(res_body);
+        cJSON_Delete(body);
         fatal("could not build offsets reply");
     }
 
     const cJSON *it = NULL;
     cJSON_ArrayForEach(it, keys_arr_obj) {
         if (!cJSON_IsString(it) || it->valuestring == NULL) {
-            send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
-                       69, ERR_MALFORMED_LIST);
+            res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                      69, ERR_MALFORMED_LIST);
             goto done;
         }
 
@@ -929,19 +989,21 @@ static void handle_list_committed_offsets(ServerContext *ctx, const Request *req
 
         if (!cJSON_AddNumberToObject(res_offsets_obj, (const char *)key_str,
                                      (double)ctx->lb->uncomitted_offset_start[log_idx] - 1)) {
-            cJSON_Delete(res_body);
+            cJSON_Delete(body);
             fatal("could not build offsets reply");
         }
     }
 
-    send((const u8 *)req->dest, (const u8 *)req->src, res_body);
-    res_body = NULL;
+    res_add(&res, (const u8 *)req->dest, (const u8 *)req->src, body);
+    body = NULL;
 done:
-    cJSON_Delete(res_body);
+    cJSON_Delete(body);
+    return res;
 }
 
-static void handle_txn(ServerContext *ctx, const Request *req) {
-    cJSON *res_body = NULL;
+static PendingResponseArr handle_txn(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
+    cJSON *body = NULL;
     u64 msg_id;
     if (!request_msg_id(req, &msg_id)) {
         goto done;
@@ -949,15 +1011,15 @@ static void handle_txn(ServerContext *ctx, const Request *req) {
 
     const cJSON *txn_arr_obj = cJSON_GetObjectItem(req->body, "txn");
     if (!txn_arr_obj || !cJSON_IsArray(txn_arr_obj)) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                   ERR_MALFORMED_TXN);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
+                  ERR_MALFORMED_TXN);
         goto done;
     }
 
-    res_body = reply_body(ctx->next_msg_id++, (const u8 *)"txn_ok", msg_id);
-    cJSON *res_txn_arr = cJSON_AddArrayToObject(res_body, "txn");
+    body = reply_body(ctx->next_msg_id++, (const u8 *)"txn_ok", msg_id);
+    cJSON *res_txn_arr = cJSON_AddArrayToObject(body, "txn");
     if (!res_txn_arr) {
-        cJSON_Delete(res_body);
+        cJSON_Delete(body);
         fatal("could not build txn reply");
     }
 
@@ -973,8 +1035,7 @@ static void handle_txn(ServerContext *ctx, const Request *req) {
         cJSON *op = cJSON_GetArrayItem(it, 0), *key = cJSON_GetArrayItem(it, 1),
               *val = cJSON_GetArrayItem(it, 2);
 
-        if (!op || !cJSON_IsString(op) || op->valuestring == NULL || !key ||
-            !cJSON_IsNumber(key)) {
+        if (!op || !cJSON_IsString(op) || op->valuestring == NULL || !key || !cJSON_IsNumber(key)) {
             error_in_foreach = true;
             break;
         }
@@ -988,37 +1049,37 @@ static void handle_txn(ServerContext *ctx, const Request *req) {
 
         cJSON *op_res_arr = cJSON_CreateArray();
         if (!op_res_arr) {
-            cJSON_Delete(res_body);
+            cJSON_Delete(body);
             fatal("could not build txn reply");
         }
 
         if (!cJSON_AddItemToArray(res_txn_arr, op_res_arr)) {
             cJSON_Delete(op_res_arr);
-            cJSON_Delete(res_body);
+            cJSON_Delete(body);
             fatal("could not build txn reply");
         }
 
         cJSON *op_str_obj = cJSON_CreateString(op->valuestring);
         if (!op_str_obj) {
-            cJSON_Delete(res_body);
+            cJSON_Delete(body);
             fatal("could not build txn reply");
         }
 
         if (!cJSON_AddItemToArray(op_res_arr, op_str_obj)) {
             cJSON_Delete(op_str_obj);
-            cJSON_Delete(res_body);
+            cJSON_Delete(body);
             fatal("could not build txn reply");
         }
 
         cJSON *key_res_obj = cJSON_CreateNumber((double)key->valuedouble);
         if (!key_res_obj) {
-            cJSON_Delete(res_body);
+            cJSON_Delete(body);
             fatal("could not build txn reply");
         }
 
         if (!cJSON_AddItemToArray(op_res_arr, key_res_obj)) {
             cJSON_Delete(key_res_obj);
-            cJSON_Delete(res_body);
+            cJSON_Delete(body);
             fatal("could not build txn reply");
         }
 
@@ -1032,13 +1093,13 @@ static void handle_txn(ServerContext *ctx, const Request *req) {
             }
 
             if (!val_res_obj) {
-                cJSON_Delete(res_body);
+                cJSON_Delete(body);
                 fatal("could not build txn reply");
             }
 
             if (!cJSON_AddItemToArray(op_res_arr, val_res_obj)) {
                 cJSON_Delete(val_res_obj);
-                cJSON_Delete(res_body);
+                cJSON_Delete(body);
                 fatal("could not build txn reply");
             }
         } else if (!strcmp(op->valuestring, "w")) {
@@ -1054,13 +1115,13 @@ static void handle_txn(ServerContext *ctx, const Request *req) {
 
             cJSON *val_write_obj = cJSON_CreateNumber((double)val->valuedouble);
             if (!val_write_obj) {
-                cJSON_Delete(res_body);
+                cJSON_Delete(body);
                 fatal("could not build txn reply");
             }
 
             if (!cJSON_AddItemToArray(op_res_arr, val_write_obj)) {
                 cJSON_Delete(val_write_obj);
-                cJSON_Delete(res_body);
+                cJSON_Delete(body);
                 fatal("could not build txn reply");
             }
         } else {
@@ -1070,24 +1131,25 @@ static void handle_txn(ServerContext *ctx, const Request *req) {
     }
 
     if (kv_full) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 11,
-                   ERR_KV_FULL);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 11,
+                  ERR_KV_FULL);
         goto done;
     }
 
     if (error_in_foreach) {
-        send_error((const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
-                   ERR_MALFORMED_TXN);
+        res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id, 69,
+                  ERR_MALFORMED_TXN);
         goto done;
     }
 
-    send((const u8 *)req->dest, (const u8 *)req->src, res_body);
-    res_body = NULL;
+    res_add(&res, (const u8 *)req->dest, (const u8 *)req->src, body);
+    body = NULL;
 done:
-    cJSON_Delete(res_body);
+    cJSON_Delete(body);
+    return res;
 }
 
-static const HandlerEntry handlers[] = {
+static const RequestHandlerEntry handlers[] = {
     {"read_ok", handle_read_ok},
     {"write_ok", handle_write_ok},
     {"error", handle_error},
@@ -1105,7 +1167,7 @@ static const HandlerEntry handlers[] = {
     {"txn", handle_txn},
 };
 
-static const HandlerEntry *find_handler(const char *name) {
+static const RequestHandlerEntry *find_handler(const char *name) {
     for (usize i = 0; i < ARRAY_SIZE(handlers); ++i) {
         if (strcmp(name, handlers[i].name) == 0) {
             return &handlers[i];
@@ -1114,28 +1176,77 @@ static const HandlerEntry *find_handler(const char *name) {
     return NULL;
 }
 
+static PendingResponseArr handle_request(ServerContext *ctx, const Request *req) {
+    PendingResponseArr res = {0};
+
+    if (req->src == NULL || req->dest == NULL || !cJSON_IsObject(req->body)) {
+        return res;
+    }
+
+    const cJSON *type = cJSON_GetObjectItem(req->body, "type");
+    if (!cJSON_IsString(type) || type->valuestring == NULL) {
+        return res;
+    }
+
+    const RequestHandlerEntry *entry = find_handler(type->valuestring);
+    if (entry == NULL) {
+        u64 msg_id;
+        if (request_msg_id(req, &msg_id)) {
+            res_error(&res, (const u8 *)req->dest, (const u8 *)req->src, ctx->next_msg_id++, msg_id,
+                      10, ERR_NOT_SUPPORTED);
+        }
+        return res;
+    }
+
+    return entry->handler(ctx, req);
+}
+
+static void send(const u8 *src, const u8 *dest, cJSON *body) {
+    cJSON *res = cJSON_CreateObject();
+    if (!res) {
+        cJSON_Delete(body);
+        fatal("could not create reply envelope");
+    }
+    if (!cJSON_AddStringToObject(res, "src", (const char *)src) ||
+        !cJSON_AddStringToObject(res, "dest", (const char *)dest) ||
+        !cJSON_AddItemToObject(res, "body", body)) {
+        cJSON_Delete(res);
+        cJSON_Delete(body);
+        fatal("could not build reply envelope");
+    }
+
+    char *out = cJSON_PrintUnformatted(res);
+    if (!out) {
+        cJSON_Delete(res);
+        fatal("could not serialize reply");
+    }
+    if (printf("%s\n", out) < 0 || fflush(stdout) != 0) {
+        free(out);
+        cJSON_Delete(res);
+        fatal("could not write reply");
+    }
+
+    free(out);
+    cJSON_Delete(res);
+}
+
+static void send_response(PendingResponseArr *res) {
+    for (usize i = 0; i < res->count; ++i) {
+        cJSON *body = res->items[i].body;
+        res->items[i].body = NULL;
+        send(res->items[i].src, res->items[i].dest, body);
+    }
+    response_free(res);
+}
+
 int main(void) {
     const usize JSON_PARSE_BUF_LEN = 65536;
     u8 msg[JSON_PARSE_BUF_LEN];
 
-    ServerContext *ctx = calloc(1, sizeof *ctx);
-    if (!ctx) {
+    ServerContext *ctx = server_context_new();
+    if (ctx == NULL) {
         fatal("could not allocate server context");
     }
-
-    ctx->lb = calloc(1, sizeof *ctx->lb);
-    if (!ctx->lb) {
-        fatal("could not allocate log buffers");
-    }
-
-    ctx->kvs = calloc(1, sizeof *ctx->kvs);
-    if (!ctx->kvs) {
-        fatal("could not allocate kv buffer");
-    }
-
-    ctx->bd_msg.cap = 4096;
-    ctx->next_msg_id = 1;
-    ctx->prev_generate_time_ms = now_ms();
 
     if (setvbuf(stdin, NULL, _IONBF, 0) != 0) {
         fatal("could not disable stdin buffering");
@@ -1143,7 +1254,10 @@ int main(void) {
 
     for (;;) {
         i64 loop_now = now_ms();
-        reap_pending_reads(ctx, loop_now);
+
+        PendingResponseArr timeout_res = {0};
+        reap_pending_reads(ctx, loop_now, &timeout_res);
+        send_response(&timeout_res);
 
         struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
         int ready = poll(&pfd, 1, pending_read_timeout_ms(ctx, loop_now));
@@ -1167,12 +1281,14 @@ int main(void) {
             continue;
         }
 
+        Request req = {0};
+        PendingResponseArr res = {0};
+        const cJSON *src, *dest, *body, *type;
+
         if (!cJSON_IsObject(msg_json)) {
             fprintf(stderr, "message is not a JSON object\n");
             goto next;
         }
-
-        const cJSON *src, *dest, *body, *type;
 
         if (!cJSON_HasObjectItem(msg_json, "src") || !cJSON_HasObjectItem(msg_json, "dest") ||
             !cJSON_HasObjectItem(msg_json, "body")) {
@@ -1201,11 +1317,9 @@ int main(void) {
             goto next;
         }
 
-        Request req = {
-            .src = src->valuestring,
-            .dest = dest->valuestring,
-            .body = body,
-        };
+        req.src = src->valuestring;
+        req.dest = dest->valuestring;
+        req.body = body;
 
         const cJSON *msg_id_obj = cJSON_GetObjectItem(body, "msg_id");
         if (cJSON_IsNumber(msg_id_obj)) {
@@ -1213,32 +1327,20 @@ int main(void) {
             req.has_msg_id = true;
         }
 
-        const HandlerEntry *entry = find_handler(type->valuestring);
-        if (entry == NULL) {
-            u64 msg_id;
-            if (request_msg_id(&req, &msg_id)) {
-                send_error((const u8 *)req.dest, (const u8 *)req.src, ctx->next_msg_id++, msg_id,
-                           10, ERR_NOT_SUPPORTED);
-            }
-            goto next;
-        }
+        res = handle_request(ctx, &req);
+        send_response(&res);
 
-        entry->handler(ctx, &req);
-
-next:
+    next:
+        response_free(&res);
         cJSON_Delete(msg_json);
     }
 
     if (ferror(stdin)) {
         fprintf(stderr, "could not read stdin\n");
-        free(ctx->kvs);
-        free(ctx->lb);
-        free(ctx);
+        server_context_free(ctx);
         return EXIT_FAILURE;
     }
 
-    free(ctx->kvs);
-    free(ctx->lb);
-    free(ctx);
+    server_context_free(ctx);
     return EXIT_SUCCESS;
 }
