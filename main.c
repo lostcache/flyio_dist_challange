@@ -307,7 +307,7 @@ static bool find_pending_kv_read_all(ServerContext *ctx, u64 kv_msg_id, PendingK
 
 // Looks up a log index by key. On success writes the index to out and returns true. lb and key are
 // borrowed.
-static bool find_log_idx_by_key(LogBuffers *lb, const char *key, usize *out) {
+static bool find_log_idx_by_key(const LogBuffers *lb, const char *key, usize *out) {
     for (usize i = 0; i < lb->next_log_idx; ++i) {
         if (!strncmp(key, lb->keys[i], MAX_LOG_KEY_LEN)) {
             *out = i;
@@ -319,7 +319,7 @@ static bool find_log_idx_by_key(LogBuffers *lb, const char *key, usize *out) {
 
 // Looks up a KV entry index by key. On success writes the index to out and returns true. kvs is
 // borrowed.
-static bool find_kv_entry_idx_by_key(KVStore *kvs, i64 key, usize *out) {
+static bool find_kv_entry_idx_by_key(const KVStore *kvs, i64 key, usize *out) {
     for (usize i = 0; i < kvs->empty_idx; ++i) {
         if (kvs->keys[i] == key) {
             *out = i;
