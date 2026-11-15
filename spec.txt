@@ -1,0 +1,24 @@
+A3. Uninitialized NODE_ID used before init.
+Line 167 declares NODE_ID on the stack. The read, add, and read_ok handlers use it (257, 440, 467, 506, 520, 523). Only generate checks node_id_set (373). A message that arrives before init reads uninitialized stack memory. The behavior is undefined. Add one guard before dispatch: all handlers except init reject with error code 11 when node_id_set is false.
+References: Redis — src/blocked.c (blocked clients have timeouts and a release path); Linux kernel — coding-style.rst §7 (release inside the same error chain).
+D. Naming and conventions
+E. Build and tooling
+E1. Add a Makefile; move the strict flags into it.
+Your .clangd sets -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wstrict-prototypes -Wmissing-prototypes -Wundef -Werror. The build command clang main.c -lcjson (from your .clangd comment) uses none of them. The editor warns; the build accepts. Create a Makefile with one CFLAGS list, plus -O2 -g. The build must fail on warnings.
+References: curl — one WARNCFLAGS list in CMakeLists.txt drives every build; FFmpeg — configure defines the warning set and offers --enable-werror; Linux kernel — Kbuild sets the flags for every build and CONFIG_WERROR turns warnings into errors.
+E2. Build with sanitizers in development and CI.
+Add a make asan target: clang -fsanitize=address,undefined. Run the Maelstrom workloads under it. Item A1 appears on the first run. Items A2, A3, and A4 appear under UBSan.
+References: Redis — CI sanitizer builds (.github/workflows/CI.yml); SQLite — each release runs under valgrind and fuzzers (sqlite.org/testing.html).
+E3. Fuzz the parser.
+After item B4, the core builds without stdin/stdout. Add a libFuzzer target that feeds random bytes to the parser. Seed it with a corpus of Maelstrom messages.
+References: curl — fuzz/ targets run under OSS-Fuzz; SQLite — fuzzcheck.c in the tree (sqlite.org/testing.html).
+E4. Run the analyzers headless.
+Your .clangd selects bugprone-*, clang-analyzer-*, performance-*, portability-*. These run only in your editor. Run the same clang-tidy set, plus cppcheck, as a make lint target. A defect found only in your editor is a defect your build accepts.
+References: Linux kernel — scripts/checkpatch.pl and sparse run on every submitted patch.
+E5. Run the Maelstrom checks as one command.
+Wrap your test runs in make check. Run each completed workload (kafka, txn-rw-register). CI then proves that a change does not break a passed challenge.
+References: FFmpeg — make fate; curl — make test (tests/data).
+E6. Keep build artifacts out of the tree.
+a.out sits in the project root and .gitignore does not list it. Add *.out to .gitignore and delete the file.
+References: Linux kernel — O= builds keep objects out of the source tree; FFmpeg and curl — .gitignore lists all build outputs.
+Suggested order of work: E1, E2, E6 first (cheap; ASan then finds the leaks). Then group A. Then group B, because the structure changes make C and D easy. Then C, D, and E3–E5.
